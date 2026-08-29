@@ -1,3 +1,5 @@
+<img src="logo.png" width="96" alt="Ravensight" />
+
 # Ravensight Godot SDK
 
 Official Godot 4 SDK for [Ravensight](https://ravensight.io): player
