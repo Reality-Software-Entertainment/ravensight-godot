@@ -191,11 +191,10 @@ func _on_session_response(_result: int, response_code: int, headers: PackedStrin
 		var parsed = _parse_json(body)
 		if parsed is Dictionary and parsed.has("token"):
 			session_token = str(parsed["token"])
-			if parsed.has("expiresAt"):
-				session_expires_at = int(parsed["expiresAt"])
-			else:
-				var expires_in := int(parsed.get("expiresIn", 86400))
-				session_expires_at = int(Time.get_unix_time_from_system()) + expires_in
+			# The server sends expiresIn (seconds) and expiresAt (an ISO
+			# string, which int() would mangle). expiresIn is the contract.
+			var expires_in := int(parsed.get("expiresIn", 86400))
+			session_expires_at = int(Time.get_unix_time_from_system()) + expires_in
 
 			_backoff_seconds = DEFAULT_RETRY_SECONDS
 			print("Ravensight: session ready")
@@ -271,6 +270,8 @@ func _flush_pending() -> void:
 	_flush_in_progress = true
 
 	var batch_size: int = min(MAX_BATCH_SIZE, pending_events.size())
+	if _split_batch_size > 0:
+		batch_size = mini(batch_size, _split_batch_size)
 	var batch: Array = pending_events.slice(0, batch_size)
 
 	var http := HTTPRequest.new()
@@ -294,6 +295,7 @@ func _on_batch_response(_result: int, response_code: int, headers: PackedStringA
 	if response_code == 202:
 		pending_events = pending_events.slice(batch_size, pending_events.size())
 		_backoff_seconds = DEFAULT_RETRY_SECONDS
+		_split_batch_size = 0
 		events_flushed.emit(batch_size)
 		if not pending_events.is_empty():
 			call_deferred("_flush_pending")
@@ -309,6 +311,22 @@ func _on_batch_response(_result: int, response_code: int, headers: PackedStringA
 		push_warning("Ravensight: track/batch rate-limited (%s)" % reason)
 		flush_failed.emit(reason)
 		_schedule_retry(_extract_retry_after(headers))
+	elif response_code == 400:
+		# The server refuses the whole batch when any event in it violates a
+		# ceiling. Halve until the poison event is isolated, then drop it -
+		# one bloated event must never cost the rest of its batch, and
+		# retrying the identical payload forever would deliver nothing.
+		var reason400 := _extract_error(body, "http_400")
+		if batch_size <= 1:
+			pending_events = pending_events.slice(batch_size, pending_events.size())
+			push_warning("Ravensight: dropped one rejected event (%s)" % reason400)
+			flush_failed.emit(reason400)
+			if not pending_events.is_empty():
+				call_deferred("_flush_pending")
+		else:
+			_split_batch_size = maxi(1, batch_size / 2)
+			push_warning("Ravensight: batch rejected (%s), splitting to %d" % [reason400, _split_batch_size])
+			call_deferred("_flush_pending")
 	else:
 		var reason2 := _extract_error(body, "http_%d" % response_code)
 		push_warning("Ravensight: batch flush failed (HTTP %d), will retry" % response_code)
