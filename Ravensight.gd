@@ -71,6 +71,9 @@ var tracking_enabled: bool = true
 
 var pending_events: Array = []
 var _flush_in_progress: bool = false
+# When a 400 forced a split, flushes use this reduced batch size until the
+# poison event is isolated and dropped (0 = no split active).
+var _split_batch_size: int = 0
 
 var _backoff_seconds: float = DEFAULT_RETRY_SECONDS
 var _retry_timer: Timer

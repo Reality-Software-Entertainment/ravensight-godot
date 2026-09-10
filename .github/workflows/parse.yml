@@ -1,0 +1,24 @@
+name: Parse check
+on: [push, pull_request]
+jobs:
+  gdscript-parse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Cache Godot
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/godot
+          key: godot-4.5-stable-linux
+      - name: Download Godot
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/godot
+          curl -sL -o ~/godot/godot.zip \
+            https://github.com/godotengine/godot/releases/download/4.5-stable/Godot_v4.5-stable_linux.x86_64.zip
+          unzip -q ~/godot/godot.zip -d ~/godot
+          mv ~/godot/Godot_v4.5-stable_linux.x86_64 ~/godot/godot
+          chmod +x ~/godot/godot
+      - name: Parse-check the SDK
+        run: bash check-gdscript.sh ~/godot/godot Ravensight.gd
