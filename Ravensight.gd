@@ -21,7 +21,9 @@ signal session_failed(reason: String)
 ## "server") or the player has opted out (source "player"), and again when
 ## set_tracking_enabled(false) is called.
 signal tracking_disabled(source: String)
-## Emitted after a batch of events is accepted by the server.
+## Emitted after a batch of events is delivered (the server answered 2xx).
+## `count` is the number sent; the server may store fewer, e.g. it drops
+## events whose timestamp is older than 90 days.
 signal events_flushed(count: int)
 ## Emitted when a batch flush attempt fails (will be retried automatically).
 signal flush_failed(reason: String)
