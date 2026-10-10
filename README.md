@@ -47,6 +47,17 @@ Ravensight.reset_device_id()            # forget this install's analytics identi
 Full guide: https://github.com/Reality-Software-Entertainment/ravensight,
 see `GODOT_GUIDE.md`.
 
+## Quitting
+
+So the last events (including `game_exited`) are actually sent, the SDK
+takes over the window close: it sets `get_tree().auto_accept_quit = false`,
+flushes on a close request, and calls `get_tree().quit()` itself when the
+flush is answered or after 1.5 seconds. It also flushes when the game is
+backgrounded. If your game has its own "really quit?" flow, set
+`Ravensight.handle_quit = false` before the SDK's `_ready()` and call
+`Ravensight.flush()` before you quit. Full details:
+https://ravensight.io/docs/#godot-sdk
+
 ## License
 
 MIT

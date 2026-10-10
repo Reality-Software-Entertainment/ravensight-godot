@@ -1,4 +1,4 @@
-# Ravensight.gd — Ravensight SDK v2
+# Ravensight.gd: Ravensight SDK v2
 # Global autoload script for tracking game events against the hosted
 # Ravensight SaaS API (/api/v1).
 #
@@ -43,12 +43,12 @@ signal event_tracked(event_name: String, data: Dictionary)
 ## --- Configuration ---------------------------------------------------------
 
 ## Base URL of your Ravensight instance, e.g. "https://api.yourgame.com".
-## Do NOT include a trailing slash or "/api/v1" — that's appended for you.
+## Do NOT include a trailing slash or "/api/v1"; that is appended for you.
 @export var api_url: String = "https://your-ravensight-instance.example.com"
 
 ## Your game's PUBLISHABLE ingest key (format: gt_live_...), copied from the
 ## Ravensight dashboard when you created the game. This key is safe to ship
-## inside your game binary — it can only create sessions and read the
+## inside your game binary: it can only create sessions and read the
 ## tracking kill switch. It can NOT read analytics, feedback, or manage your
 ## account. Rotate it from the dashboard if it ever needs to change.
 @export var ingest_key: String = "gt_live_your_ingest_key_here"
@@ -98,12 +98,43 @@ var _player_opted_out: bool = false
 
 var pending_events: Array = []
 var _flush_in_progress: bool = false
+## Bumped every time the queue is discarded (opt-out, reset_device_id(), the
+## server kill switch). Bound into each batch request's callback so a
+## response for a batch taken from the old queue is ignored, instead of
+## slicing that many events off the front of the new one.
+var _queue_generation: int = 0
 # When a 400 forced a split, flushes use this reduced batch size until the
 # poison event is isolated and dropped (0 = no split active).
 var _split_batch_size: int = 0
 
 var _backoff_seconds: float = DEFAULT_RETRY_SECONDS
 var _retry_timer: Timer
+
+## --- Quit handling --------------------------------------------------------------
+
+## When true (the default), the SDK takes over the window close so the last
+## events, including game_exited, can be sent: it sets the SceneTree's
+## auto_accept_quit to false in _ready(), and on a close request it flushes,
+## then calls get_tree().quit() itself once the flush is answered or after
+## QUIT_FLUSH_TIMEOUT_SECONDS, whichever comes first. The Android back
+## button is handled the same way when the project's
+## application/config/quit_on_go_back setting is on. Set this to false
+## the same way as api_url (before the autoload is ready) if your game manages
+## quitting itself, e.g. with a confirm dialog; the SDK then only tracks
+## game_exited and flushes, and your own code calls get_tree().quit(). It is
+## also treated as false when auto_accept_quit is already off at _ready().
+@export var handle_quit: bool = true
+
+## Longest the SDK delays a quit while it waits for the final flush.
+const QUIT_FLUSH_TIMEOUT_SECONDS: float = 1.5
+
+## True when the SDK owns the window close (see handle_quit).
+var _owns_close_quit: bool = false
+## True when the SDK owns the Android back button quit (see handle_quit).
+var _owns_go_back_quit: bool = false
+## Set once a close request has started the flush then quit sequence.
+var _quitting: bool = false
+var _quit_called: bool = false
 
 ## --- Playtest mode ------------------------------------------------------------
 ##
@@ -154,6 +185,8 @@ func _ready() -> void:
 	add_child(_retry_timer)
 	_retry_timer.timeout.connect(_on_retry_timer_timeout)
 
+	_take_over_quit()
+
 	if _player_opted_out:
 		# Nothing leaves the device, not even the settings check.
 		print("Ravensight: tracking disabled by player opt-out")
@@ -161,32 +194,103 @@ func _ready() -> void:
 	else:
 		_check_server_settings()
 
+## Godot quits the moment a close request arrives while auto_accept_quit is
+## on, which leaves no time to send anything. Unless the game opted out (see
+## handle_quit), the SDK turns that off and calls quit() itself after the
+## final flush. The Android back button quits through a separate switch,
+## quit_on_go_back, so it is taken over only when the project has it on.
+func _take_over_quit() -> void:
+	var tree := get_tree()
+	if not handle_quit or not tree.auto_accept_quit:
+		return
+	tree.auto_accept_quit = false
+	_owns_close_quit = true
+	if bool(ProjectSettings.get_setting("application/config/quit_on_go_back", true)) and tree.quit_on_go_back:
+		tree.quit_on_go_back = false
+		_owns_go_back_quit = true
+
 func _notification(what: int) -> void:
-	if what == NOTIFICATION_WM_CLOSE_REQUEST:
-		if tracking_enabled:
-			track_event("game_exited", {})
-			# Best-effort: give the request a brief moment to leave before
-			# the process exits. Not guaranteed to complete on all platforms.
-			if _is_session_valid():
-				await get_tree().create_timer(0.5).timeout
+	match what:
+		NOTIFICATION_WM_CLOSE_REQUEST:
+			if _owns_close_quit:
+				_flush_then_quit()
+			else:
+				_track_exit_and_flush()
+		NOTIFICATION_WM_GO_BACK_REQUEST:
+			if _owns_go_back_quit:
+				_flush_then_quit()
+			else:
+				# The back button does not quit this project: just send what
+				# is queued, in case the app is about to be backgrounded.
+				_flush_pending()
+		NOTIFICATION_APPLICATION_PAUSED, NOTIFICATION_APPLICATION_FOCUS_OUT:
+			# Mobile can suspend or kill a backgrounded app without another
+			# notification, so send what is queued while there is a chance.
+			_flush_pending()
+
+## The game manages quitting itself: record the exit and send it, best effort.
+## Whether it arrives depends on how soon the game's own quit() follows.
+func _track_exit_and_flush() -> void:
+	if not tracking_enabled:
+		return
+	_enqueue_and_emit("game_exited", {})
+	_flush_pending()
+
+## Records game_exited, sends the queue and quits when that flush is answered
+## or after QUIT_FLUSH_TIMEOUT_SECONDS, whichever comes first. A flush already
+## in flight is not interrupted: game_exited is queued behind it and sent by
+## the follow-up flush that a successful response starts.
+func _flush_then_quit() -> void:
+	if _quitting:
+		return
+	_quitting = true
+	if tracking_enabled:
+		_enqueue_and_emit("game_exited", {})
+	var can_send := _is_session_valid() or _session_request_pending
+	if not tracking_enabled or pending_events.is_empty() or not can_send:
+		_finish_quit()
+		return
+	# Ignore time scale and pause, so a paused or slowed game still quits.
+	get_tree().create_timer(QUIT_FLUSH_TIMEOUT_SECONDS, true, false, true).timeout.connect(_finish_quit)
+	# A no-op while a flush is in flight or the session is still being
+	# opened; the response handlers carry on from there.
+	_flush_pending()
+
+func _finish_quit() -> void:
+	if _quit_called:
+		return
+	_quit_called = true
+	get_tree().quit()
 
 ## --- Device ID persistence ----------------------------------------------------
 
 func _load_or_create_device_id() -> String:
-	# An id saved by any earlier version is kept exactly as it is, whatever
-	# its shape, so existing players keep their history. Only a fresh
-	# install gets the random id below.
+	# A saved id is kept only when it has the random shape that
+	# _generate_device_id() produces. SDKs before the random id saved
+	# OS.get_unique_id() + "_" + OS.get_name() + "_" + a timestamp, which is
+	# derived from the hardware or OS install; such an id is replaced with a
+	# fresh random one (and saved) so an upgraded install carries no hardware
+	# identifier either. That install starts a new analytics identity.
 	if FileAccess.file_exists(DEVICE_ID_PATH):
 		var file := FileAccess.open(DEVICE_ID_PATH, FileAccess.READ)
 		if file:
-			var saved_id := file.get_as_text()
+			var saved_id := file.get_as_text().strip_edges()
 			file.close()
-			if saved_id.length() > 0:
+			if _is_random_device_id(saved_id):
 				return saved_id
 
 	var new_id := _generate_device_id()
 	_save_device_id(new_id)
 	return new_id
+
+## True when `id` has the shape _generate_device_id() produces: exactly 32
+## lowercase hex characters, a dash, then the lowercased OS name. A legacy
+## hardware derived id never matches, since it joins its parts with
+## underscores and keeps the OS name's capitals.
+func _is_random_device_id(id: String) -> bool:
+	var pattern := RegEx.new()
+	pattern.compile("^[0-9a-f]{32}-[a-z0-9]+$")
+	return pattern.search(id) != null
 
 ## A new device id: 16 random bytes as lowercase hex, a dash, and the
 ## lowercased OS name (kept because the per-OS split in analytics reads it),
@@ -416,11 +520,22 @@ func _on_session_response(_result: int, response_code: int, headers: PackedStrin
 		_playtest_blocked = true
 		push_error("Ravensight: playtest session refused (%s)" % reason3)
 		session_failed.emit(reason3)
+	elif response_code == 403 and _is_tracking_disabled_reason(body):
+		# The kill switch went off after boot (the server refuses new
+		# sessions for a disabled game). Retrying can never succeed, so this
+		# ends tracking for the run; see _on_server_tracking_disabled().
+		session_failed.emit("tracking_disabled")
+		_on_server_tracking_disabled()
+		return
 	else:
 		var reason2 := _extract_error(body, "http_%d" % response_code)
 		push_error("Ravensight: session creation failed (HTTP %d)" % response_code)
 		session_failed.emit(reason2)
 		_schedule_retry()
+
+	# Quitting and no session came of it: nothing more can be sent.
+	if _quitting and response_code != 201:
+		_finish_quit()
 
 ## --- Retry / backoff ------------------------------------------------------------
 
@@ -444,14 +559,19 @@ func _on_retry_timer_timeout() -> void:
 
 ## Queue an event for delivery. Events are flushed in batches (up to 50 at a
 ## time) via POST /api/v1/track/batch as soon as a valid session is available.
-## Safe to call before the session is ready — events are queued and sent once
+## Safe to call before the session is ready: events are queued and sent once
 ## the session is established (or once tracking is confirmed enabled).
 func track_event(event_name: String, data: Dictionary = {}) -> void:
 	if not tracking_enabled:
 		return
 
-	var queued_data := _enqueue(event_name, data)
-	event_tracked.emit(event_name, queued_data)
+	_enqueue_and_emit(event_name, data)
+
+	# A retry or backoff wait is running: leave the event queued and let the
+	# timer send it. Flushing (or reopening a session) on every tracked event
+	# would defeat the backoff, including a server's Retry-After.
+	if _retry_timer != null and not _retry_timer.is_stopped():
+		return
 
 	if _is_session_valid():
 		_flush_pending()
@@ -478,13 +598,19 @@ func flush() -> void:
 ## back on re-reads the server kill switch, which still wins when it says
 ## off, then opens a new session and sends game_started as on boot.
 func set_tracking_enabled(enabled: bool) -> void:
+	# Turning on a player who never opted out changes nothing: tracking is
+	# already as on as the server allows, and re-running the boot sequence
+	# would send a second game_started.
+	if enabled and not _player_opted_out:
+		return
+
 	_player_opted_out = not enabled
 	_write_optout_flag(_player_opted_out)
 
 	if _player_opted_out:
 		tracking_enabled = false
 		_drop_session()
-		pending_events.clear()
+		_clear_queue()
 		_retry_timer.stop()
 		print("Ravensight: tracking disabled by player opt-out")
 		tracking_disabled.emit("player")
@@ -510,7 +636,7 @@ func reset_device_id() -> void:
 	device_id = _generate_device_id()
 	_save_device_id(device_id)
 	_drop_session()
-	pending_events.clear()
+	_clear_queue()
 
 func _write_optout_flag(opted_out: bool) -> void:
 	if opted_out:
@@ -529,6 +655,40 @@ func _drop_session() -> void:
 	session_expires_at = 0
 	_session_request_pending = false
 	_session_request_generation += 1
+
+## Discards every queued event. Bumping _queue_generation makes the response
+## to any batch still in flight a no-op (see _on_batch_response()), and the
+## in-flight flag is released so events queued from now on can go out without
+## waiting for that stale answer.
+func _clear_queue() -> void:
+	pending_events.clear()
+	_queue_generation += 1
+	_flush_in_progress = false
+	_split_batch_size = 0
+
+## The kill switch was turned off while the game is running: the server
+## refused a session with 403 tracking_disabled. Fatal for the rest of the
+## run, like the boot check saying off: nothing is queued, sent or retried
+## until set_tracking_enabled() re-reads the switch or the game restarts.
+func _on_server_tracking_disabled() -> void:
+	_server_tracking_enabled = false
+	tracking_enabled = false
+	_drop_session()
+	_clear_queue()
+	_retry_timer.stop()
+	print("Ravensight: tracking disabled by server kill switch")
+	tracking_disabled.emit("server")
+	if _quitting:
+		_finish_quit()
+
+func _is_tracking_disabled_reason(body: PackedByteArray) -> bool:
+	return _extract_error(body, "") == "tracking_disabled"
+
+## Queues the event and announces it on event_tracked with the data actually
+## queued.
+func _enqueue_and_emit(event_name: String, data: Dictionary) -> void:
+	var queued_data := _enqueue(event_name, data)
+	event_tracked.emit(event_name, queued_data)
 
 ## Queues the event and returns the data dictionary actually stored (a
 ## tagged copy in a playtest run, the original otherwise), so callers such
@@ -565,7 +725,7 @@ func _flush_pending() -> void:
 
 	var http := HTTPRequest.new()
 	add_child(http)
-	http.request_completed.connect(_on_batch_response.bind(http, batch_size))
+	http.request_completed.connect(_on_batch_response.bind(http, batch_size, _queue_generation))
 
 	var headers := ["Content-Type: application/json", "X-Session-Token: " + session_token]
 	var body := JSON.stringify({"events": batch})
@@ -577,8 +737,16 @@ func _flush_pending() -> void:
 		push_error("Ravensight: failed to start batch flush (error %d)" % err)
 		_schedule_retry()
 
-func _on_batch_response(_result: int, response_code: int, headers: PackedStringArray, body: PackedByteArray, http: HTTPRequest, batch_size: int) -> void:
+func _on_batch_response(_result: int, response_code: int, headers: PackedStringArray, body: PackedByteArray, http: HTTPRequest, batch_size: int, generation: int) -> void:
 	http.queue_free()
+
+	# The queue this batch was taken from has been discarded since it went
+	# out (see _clear_queue()). Its events are gone, so slicing batch_size
+	# off the front now would drop events queued afterwards; the flag was
+	# already released by the clear.
+	if generation != _queue_generation:
+		return
+
 	_flush_in_progress = false
 
 	if response_code == 202:
@@ -595,6 +763,9 @@ func _on_batch_response(_result: int, response_code: int, headers: PackedStringA
 		session_token = ""
 		session_expires_at = 0
 		_start_session()
+	elif response_code == 403 and _is_tracking_disabled_reason(body):
+		_on_server_tracking_disabled()
+		return
 	elif response_code == 429:
 		var reason := _extract_error(body, "rate_limited")
 		push_warning("Ravensight: track/batch rate-limited (%s)" % reason)
@@ -621,6 +792,14 @@ func _on_batch_response(_result: int, response_code: int, headers: PackedStringA
 		push_warning("Ravensight: batch flush failed (HTTP %d), will retry" % response_code)
 		flush_failed.emit(reason2)
 		_schedule_retry()
+
+	# Quitting: this answer is what the quit was waiting for. Keep going only
+	# while the queue is still draining (more batches, a split, or a session
+	# refresh); a failure is not retried. The quit timer bounds the wait.
+	if _quitting:
+		var still_sending := not pending_events.is_empty() and response_code in [202, 400, 401]
+		if not still_sending:
+			_finish_quit()
 
 ## --- Public API: feedback (POST /api/v1/feedback) --------------------------------
 
