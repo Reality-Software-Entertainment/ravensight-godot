@@ -50,6 +50,8 @@ func _run() -> void:
 		"test_game_started_once",
 		"test_quit_sends_one_game_exited",
 		"test_quit_holds_at_most_1_5_seconds",
+		"test_quit_after_offline_sends_before_quitting",
+		"test_later_enable_stamps_game_started_now",
 		"test_close_request_without_handle_quit_once",
 		"test_mobile_background_under_timeout",
 		"test_mobile_background_past_timeout",
@@ -604,13 +606,16 @@ func test_quit_holds_at_most_1_5_seconds() -> void:
 
 func test_close_request_without_handle_quit_once() -> void:
 	var sdk := started_with_session({"handle_quit": false})
+	sdk.track_event("before_close")
 	sdk.notification(Node.NOTIFICATION_WM_CLOSE_REQUEST)
+	eq(sdk.event_names(sdk.unanswered()[0]), ["before_close"], "a close request only flushes")
 	sdk.answer_all_ok()
 	sdk.notification(Node.NOTIFICATION_WM_CLOSE_REQUEST)
+	eq(sent_count(sdk, "game_exited"), 0, "a cancelled close sends no game_exited")
+	eq(sdk.quit_codes, [], "and does not quit")
 	sdk.quit()
 	sdk.answer_all_ok()
-	var exits := sent_count(sdk, "game_exited")
-	eq(exits, 1, "a cancelled close plus quit() send one game_exited")
+	eq(sent_count(sdk, "game_exited"), 1, "quit() sends the one game_exited")
 	eq(sdk.quit_codes, [0], "quit() quits")
 
 func test_mobile_background_under_timeout() -> void:
@@ -709,3 +714,37 @@ func test_settings_429_waits_retry_after() -> void:
 	eq(sdk.requests.size(), 1, "nothing before Retry-After")
 	sdk.advance(1.0)
 	eq(sdk.paths(), ["/settings", "/session"], "then the session, with the kill switch assumed on")
+
+func test_quit_after_offline_sends_before_quitting() -> void:
+	var sdk := start()
+	sdk.answer(200, {"trackingEnabled": true})
+	sdk.answer(0, "")
+	sdk.track_event("last")
+	sdk.advance(3.0)
+	sdk.quit()
+	eq(sdk.unanswered().size(), 1, "quit cuts the backoff short and opens a session")
+	sdk.answer(201, {"token": "t", "expiresIn": 86400})
+	eq(sdk.unanswered().size(), 1, "the batch goes out once the session opens")
+	if sdk.unanswered().size() == 1:
+		eq(sdk.event_names(sdk.unanswered()[0]), ["game_started", "last", "game_exited"], "everything queued")
+	eq(sdk.quit_codes, [], "not quit yet")
+	sdk.answer(202, {})
+	eq(sdk.quit_codes, [0], "quit once the batch is answered")
+	eq(sdk.pending_events.size(), 0, "nothing left behind")
+
+func test_later_enable_stamps_game_started_now() -> void:
+	var sdk := start({"enabled": false})
+	sdk.fake_unix += 120
+	sdk.set_enabled(true)
+	eq(int(sdk.pending_events[0]["timestamp"]), sdk.fake_unix, "game_started carries the time it was enabled")
+
+	_write("ravensight_optout.save", "1")
+	var opted := start()
+	opted.fake_unix += 300
+	opted.set_tracking_enabled(true)
+	eq(int(opted.pending_events[0]["timestamp"]), opted.fake_unix, "and the time the player opted in")
+
+	var quitter := make()
+	quitter.quit()
+	eq(quitter.quit_codes, [0], "quit() before the node is in the tree does not crash")
+	quitter.free()

@@ -196,8 +196,9 @@ var _logged_once: Dictionary = {}
 ## button is handled the same way when the project's
 ## application/config/quit_on_go_back setting is on. Set this to false
 ## before the autoload is ready if your game manages the window close
-## itself, e.g. with a confirm dialog; the SDK then queues game_exited and
-## flushes on a close request, and your game quits with Ravensight.quit().
+## itself, e.g. with a confirm dialog; the SDK then only flushes on a close
+## request, and your game quits with Ravensight.quit(), which sends
+## game_exited.
 ## It is also treated as false when auto_accept_quit is already off at
 ## _ready().
 @export var handle_quit: bool = true
@@ -226,7 +227,6 @@ var _quit_exit_code: int = 0
 ## The playtest auth token, sent as the X-Ravensight-Playtest header on every
 ## request. Empty outside a playtest run.
 var playtest_token := ""
-var _playtest_run_id: String = ""
 ## Tags merged into every tracked event's data while playtest_token is set;
 ## see set_playtest_context().
 var _playtest_tags := {}
@@ -275,7 +275,7 @@ func _ready() -> void:
 		_update_reason()
 		tracking_disabled.emit("player")
 		return
-	_activate()
+	_activate(true)
 
 func _process(_delta: float) -> void:
 	_tick()
@@ -295,11 +295,13 @@ func _tick() -> void:
 
 ## Starts tracking once the SDK is ready and active: queues game_started
 ## (once per run) and runs the kill switch check if it has not run.
-func _activate() -> void:
+## `at_boot` stamps game_started with the launch time; a game enabled later
+## in the run stamps it with the time it was enabled.
+func _activate(at_boot: bool = false) -> void:
 	if not _is_ready or not _is_active():
 		return
 	_update_reason()
-	_queue_game_started(true)
+	_queue_game_started(at_boot)
 	if not _settings_checked:
 		_check_server_settings()
 	else:
@@ -326,7 +328,7 @@ func _notification(what: int) -> void:
 			if _owns_close_quit:
 				_flush_then_quit(0)
 			else:
-				_track_exit_and_flush()
+				_flush_on_close_request()
 		NOTIFICATION_WM_GO_BACK_REQUEST:
 			if _owns_go_back_quit:
 				_flush_then_quit(0)
@@ -352,10 +354,10 @@ func _notification(what: int) -> void:
 func quit(exit_code: int = 0) -> void:
 	_flush_then_quit(exit_code)
 
-## The game manages the window close itself: record the exit and send it,
-## best effort. The game's own Ravensight.quit() follows.
-func _track_exit_and_flush() -> void:
-	_queue_game_exited()
+## The game manages the window close itself, e.g. with a "really quit?"
+## dialog that may be cancelled: send what is queued. game_exited is left to
+## the game's own Ravensight.quit(), so a cancelled close sends no exit.
+func _flush_on_close_request() -> void:
 	_flush_pending(true)
 
 ## Records game_exited, sends the queue and quits when that flush is answered
@@ -385,7 +387,10 @@ func _finish_quit() -> void:
 	_quit_tree(_quit_exit_code)
 
 func _quit_tree(exit_code: int) -> void:
-	get_tree().quit(exit_code)
+	# quit() may be called before this node is in the tree.
+	var tree := get_tree() if is_inside_tree() else Engine.get_main_loop() as SceneTree
+	if tree:
+		tree.quit(exit_code)
 
 ## --- Mobile background (Android and iOS) -------------------------------------
 
@@ -636,7 +641,6 @@ func set_playtest_context(ctx: Dictionary) -> void:
 		return
 
 	playtest_token = token
-	_playtest_run_id = run_id
 	device_id = "pt-" + run_id
 	# A fresh context is a fresh attempt, even if the previous one ended in
 	# a fatal rejection.
@@ -756,6 +760,8 @@ func _on_session_response(code: int, headers: PackedStringArray, body: PackedByt
 			var expires_in := int(parsed.get("expiresIn", 86400))
 			session_expires_at = _unix_now() + expires_in
 			_backoff_seconds = DEFAULT_RETRY_SECONDS
+			# A success ends any wait an explicit flush cut short.
+			_stop_retry()
 			_key_refused = false
 			_transient_reason = ""
 			_update_reason()
@@ -1128,6 +1134,7 @@ func _on_batch_response(code: int, headers: PackedStringArray, body: PackedByteA
 	if code == 202 or code == 200:
 		_drop_front(batch_size)
 		_backoff_seconds = DEFAULT_RETRY_SECONDS
+		_stop_retry()
 		_split_batch_size = 0
 		_reauth_attempts = 0
 		_key_refused = false

@@ -109,12 +109,14 @@ The SDK sends exactly two events by itself:
   It is never queued while the SDK is disabled or the player has opted out;
   a game enabled later in the run queues it then, once.
 - **`game_exited`**, once, when the game quits through `Ravensight.quit()`,
-  the window close, or the Android back button when the SDK handles that
-  quit. Losing focus on a desktop is not an exit: it only sends what is
+  or through the window close or the Android back button when the SDK
+  handles that quit (`handle_quit`). Losing focus on a desktop is not an exit: it only sends what is
   queued.
 
-**Android and iOS.** Going to the background sends what is queued and saves
-a small marker (`user://ravensight_bg.save`); no event is sent. Back in the
+**Android and iOS.** Going to the background tries to send what is queued
+(the engine stops its main loop there, so it may not finish) and saves a
+small marker (`user://ravensight_bg.save`); no event is sent. The marker is
+what guarantees the exit event. Back in the
 foreground within 30 minutes (`session_timeout`), nothing happens. After 30
 minutes or more, the old session gets `game_exited` stamped with the moment
 the app went to the background, and a new session starts with
@@ -143,8 +145,9 @@ func _on_quit_pressed() -> void:
 
 If your game has its own "really quit?" dialog on the window close, set
 `Ravensight.handle_quit = false` before Ravensight's `_ready()`. The SDK
-then queues `game_exited` (once) and flushes on a close request, and your
-dialog calls `Ravensight.quit()` when the player confirms.
+then only flushes on a close request, so a cancelled close sends no exit,
+and your dialog calls `Ravensight.quit()` when the player confirms, which
+sends `game_exited`.
 
 ## Startup and failures
 
@@ -254,7 +257,7 @@ bash check-gdscript.sh path/to/godot Ravensight.gd   # the parse check
 
 `tests/run.sh` wraps `godot --headless --script tests/run.gd`, because
 Godot's command line exits 0 even when a script fails to parse. For 0.2.0
-both were run on macOS with Godot v4.8.dev1 (193 checks in 34 tests, all
+both were run on macOS with Godot v4.8.dev1 (205 checks in 36 tests, all
 passing). CI runs both with Godot 4.5-stable on every push
 (`.github/workflows/parse.yml`). The tests replace the network layer; for
 0.2.0 the real `HTTPRequest` path was also run once, by hand, against a

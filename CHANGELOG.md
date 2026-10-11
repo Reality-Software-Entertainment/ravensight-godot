@@ -62,7 +62,8 @@ The first versioned release. `Ravensight.VERSION` is `"0.2.0"`.
   and automatic sending stops; `flush()` tries once more.
 - A request that never answered blocked sending for the rest of the run.
   Every request now gives up after 15 seconds.
-- A cancelled close request could queue `game_exited` more than once.
+- A cancelled close request (with `handle_quit = false`) queued
+  `game_exited` mid-session. It now only flushes; `quit()` sends the exit.
 - A playtest token without a run id ran as a real player. It now sends
   nothing.
 - Retry-After is honoured on 503 as well as 429; a batch 401 reopens the
