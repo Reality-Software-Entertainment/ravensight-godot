@@ -1242,6 +1242,8 @@ func _on_feedback_response(code: int, _headers: PackedStringArray, body: PackedB
 		_on_server_tracking_disabled()
 	elif code == 403 and _is_fatal_playtest_error(error):
 		_on_playtest_refused(error)
+	elif code == 403:
+		_refuse_key()
 	elif code == 401:
 		# The session expired; the next send opens a new one.
 		session_token = ""
