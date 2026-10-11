@@ -1,4 +1,4 @@
-name: Parse check
+name: Parse check and tests
 on: [push, pull_request]
 jobs:
   gdscript-parse:
@@ -20,5 +20,7 @@ jobs:
           unzip -q ~/godot/godot.zip -d ~/godot
           mv ~/godot/Godot_v4.5-stable_linux.x86_64 ~/godot/godot
           chmod +x ~/godot/godot
-      - name: Parse-check the SDK
-        run: bash check-gdscript.sh ~/godot/godot Ravensight.gd
+      - name: Parse-check the SDK and the tests
+        run: bash check-gdscript.sh ~/godot/godot Ravensight.gd tests/fake_ravensight.gd tests/run.gd
+      - name: Behaviour tests
+        run: bash tests/run.sh ~/godot/godot
