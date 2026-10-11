@@ -1,128 +1,205 @@
-# Ravensight.gd: Ravensight SDK v2
+# Ravensight.gd: Ravensight SDK for Godot 4
 # Global autoload script for tracking game events against the hosted
-# Ravensight SaaS API (/api/v1).
+# Ravensight API (/api/v1).
 #
 # Setup: Project -> Project Settings -> Autoload -> add this script,
-# name it "Ravensight", enable it. Then set `api_url` and `ingest_key`
-# in the Inspector (or override them from code before the autoload's
-# _ready() runs, e.g. via an early autoload).
+# name it "Ravensight", enable it. Then set `ingest_key` (and `api_url` if
+# you do not use https://api.ravensight.io) before the autoload's _ready()
+# runs, e.g. from an earlier autoload, or by editing the defaults below.
 #
-# See GODOT_GUIDE.md at the repo root for the full quickstart.
+# Full guide: https://ravensight.io/docs/#godot-sdk
 
 extends Node
+
+## The SDK version. Bumped with every tagged release.
+const VERSION := "0.2.0"
 
 ## --- Signals -------------------------------------------------------------
 
 ## Emitted once a session token has been issued and is ready to use.
 signal session_ready
-## Emitted when session creation fails outright (see `reason` for detail).
+## Emitted when opening a session fails. `reason` is "invalid_key" when the
+## ingest key was refused, otherwise the server's error code (or "offline").
 signal session_failed(reason: String)
-## Emitted on boot if the server-side kill switch has tracking off (source
-## "server") or the player has opted out (source "player"), and again when
-## set_tracking_enabled(false) is called.
+## Emitted when tracking turns off: source "server" for the kill switch,
+## "player" for the player's opt-out (set_tracking_enabled(false)), "init"
+## when the game turned the SDK off (enabled = false or set_enabled(false)).
 signal tracking_disabled(source: String)
+## Emitted whenever get_status_reason() changes. `reason` is one of
+## "disabled", "invalid_key", "tracking_disabled", "offline",
+## "rate_limited", "session_failed", "playtest_job_closed", or "" when
+## nothing is wrong.
+signal status_changed(reason: String)
 ## Emitted after a batch of events is delivered (the server answered 2xx).
 ## `count` is the number sent; the server may store fewer, e.g. it drops
 ## events whose timestamp is older than 90 days.
 signal events_flushed(count: int)
-## Emitted when a batch flush attempt fails (will be retried automatically).
+## Emitted when a batch flush attempt fails (it is retried automatically,
+## except a single event the server refuses with 400, which is dropped).
 signal flush_failed(reason: String)
 ## Emitted when a feedback submission is accepted.
 signal feedback_submitted
-## Emitted when a feedback submission fails.
+## Emitted when a feedback submission fails, locally ("disabled",
+## "empty_message", "invalid_category", "invalid_rating", "no_session") or
+## on the server (its error code).
 signal feedback_failed(reason: String)
 ## EXPERIMENTAL: emitted with the result of fetch_suggestions().
 ## Suggestions are AI-generated design hints and may change shape over time.
 signal suggestions_received(suggestions: Array)
-## Emitted every time track_event() queues an event, with the data actually
-## queued (playtest tags included, in a playtest run). Lets something else in
-## the running game mirror tracked events, e.g. a playtest driver watching
+## Emitted every time an event is queued, with the data actually queued
+## (playtest tags included, in a playtest run). Lets something else in the
+## running game mirror tracked events, e.g. a playtest driver watching
 ## gameplay from outside the process.
 signal event_tracked(event_name: String, data: Dictionary)
 
 ## --- Configuration ---------------------------------------------------------
 
-## Base URL of your Ravensight instance, e.g. "https://api.yourgame.com".
-## Do NOT include a trailing slash or "/api/v1"; that is appended for you.
-@export var api_url: String = "https://your-ravensight-instance.example.com"
+## The Ravensight API host. With or without a trailing "/api/v1" and with or
+## without a trailing slash: see api_base(). Empty means the default.
+@export var api_url: String = "https://api.ravensight.io"
 
 ## Your game's PUBLISHABLE ingest key (format: gt_live_...), copied from the
 ## Ravensight dashboard when you created the game. This key is safe to ship
-## inside your game binary: it can only create sessions and read the
-## tracking kill switch. It can NOT read analytics, feedback, or manage your
-## account. Rotate it from the dashboard if it ever needs to change.
+## inside your game binary: it can open sessions, read the tracking kill
+## switch and read this game's design suggestions. It can NOT read
+## analytics, feedback, or manage your account. Rotate it from the
+## dashboard if it ever needs to change.
 @export var ingest_key: String = "gt_live_your_ingest_key_here"
 
 ## Reported to the server as the client's game version.
 @export var game_version: String = "1.0.0"
 
+## False turns the SDK off for this run: no request of any kind, nothing
+## queued, no game_started, until set_enabled(true). Never saved. For a
+## player's own choice use set_tracking_enabled(), which is saved.
+@export var enabled: bool = true
+
 ## Maximum number of not-yet-sent events kept in memory while offline or
-## between flushes. Oldest events are dropped first once this is exceeded.
-@export var max_queue_size: int = 100
+## between flushes. Oldest events are dropped first once this is exceeded
+## (a queued game_started is kept).
+@export var max_queue_size: int = 500
+
+## Seconds an event may wait so it can go out with others. 50 waiting
+## events are sent at once without waiting.
+@export var flush_interval: float = 5.0
+
+## On Android and iOS: how long the app may sit in the background before
+## the session counts as over (game_exited at the moment it went to the
+## background, then a new session with game_started on return).
+@export var session_timeout: float = 1800.0
 
 ## --- Constants --------------------------------------------------------------
 
 const MAX_BATCH_SIZE: int = 50          # server hard limit on /track/batch
 const DEFAULT_RETRY_SECONDS: float = 10.0
 const MAX_BACKOFF_SECONDS: float = 300.0  # cap exponential backoff at 5 min
+## Every request gives up after this long and counts as offline.
+const REQUEST_TIMEOUT_SECONDS: float = 15.0
+## A batch 401 reopens the session at most this many times in a row.
+const MAX_REAUTH_ATTEMPTS: int = 2
+## The categories the feedback endpoint accepts. Anything else is refused
+## before it is sent.
+const FEEDBACK_CATEGORIES: Array[String] = ["bug", "suggestion", "complaint", "praise", "playtest", "other"]
 ## Where this install's random device id lives (see _load_or_create_device_id).
 const DEVICE_ID_PATH: String = "user://device_id.save"
 ## Present only while the player has opted out (see set_tracking_enabled).
 const OPTOUT_PATH: String = "user://ravensight_optout.save"
+## Present only while the app is in the background on Android or iOS.
+const BACKGROUND_MARKER_PATH: String = "user://ravensight_bg.save"
+const INVALID_KEY_MESSAGE := "Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key."
 
 ## --- State -------------------------------------------------------------------
 
 var device_id: String = ""
 
+## The open session's token, or "" until one opens. Read it if your game
+## server should join the same session (send it as `joinToken`, see the
+## HTTP API). Never write it.
 var session_token: String = ""
 var session_expires_at: int = 0
 var _session_request_pending: bool = false
-## Bumped every time _start_session() actually dispatches a request. Bound
-## into that request's callback so _on_session_response() can tell a stale
-## response (from a request superseded by a newer one, e.g. set_playtest_
-## context() switching identity mid-flight) from the current one, and
-## ignore it instead of letting it clobber session state.
+## Bumped every time a session is requested or dropped. Bound into each
+## session request's callback so a stale response (from a request
+## superseded by a newer one, e.g. set_playtest_context() switching identity
+## mid-flight) is ignored instead of clobbering session state.
 var _session_request_generation: int = 0
 
-## True unless the server-side kill switch (GET /api/v1/settings) disabled
-## tracking for this game, or the player opted out through
-## set_tracking_enabled(false). The SDK keeps it in sync; read it any time,
-## but change it through set_tracking_enabled() so the choice persists.
-var tracking_enabled: bool = true
-## The kill switch's last answer, kept apart from the player's choice so that
-## re-enabling after an opt-out can never override a server-side "off".
-var _server_tracking_enabled: bool = true
-## The player's persisted opt-out, read from OPTOUT_PATH in _ready() before
-## anything can queue or send an event.
+## Read-only: true while events are collected and sent. False when the game
+## turned the SDK off (enabled), the player opted out, the server kill
+## switch is off, or a playtest run was refused.
+var tracking_enabled: bool:
+	get:
+		return _is_active()
+	set(_value):
+		push_warning("Ravensight: tracking_enabled is read-only, use set_tracking_enabled() or set_enabled()")
+
+## The player's persisted opt-out, read from OPTOUT_PATH when the SDK is
+## constructed, before anything can queue or send an event.
 var _player_opted_out: bool = false
+## The server kill switch said off (settings check or a 403
+## tracking_disabled). Final for the rest of the run.
+var _killed: bool = false
+## The server refused the ingest key. Automatic sending stops for the run;
+## events keep queueing and an explicit flush() tries once more.
+var _key_refused: bool = false
+var _settings_checked: bool = false
+var _settings_pending: bool = false
+## Set at the end of _ready(). Before that, track_event() only queues.
+var _is_ready: bool = false
 
 var pending_events: Array = []
 var _flush_in_progress: bool = false
 ## Bumped every time the queue is discarded (opt-out, reset_device_id(), the
-## server kill switch). Bound into each batch request's callback so a
-## response for a batch taken from the old queue is ignored, instead of
-## slicing that many events off the front of the new one.
+## kill switch). Bound into each batch request's callback so a response for
+## a batch taken from the old queue is ignored, instead of slicing that
+## many events off the front of the new one.
 var _queue_generation: int = 0
-# When a 400 forced a split, flushes use this reduced batch size until the
-# poison event is isolated and dropped (0 = no split active).
+## When a 400 forced a split, flushes use this reduced batch size until the
+## poison event is isolated and dropped (0 = no split active).
 var _split_batch_size: int = 0
+## When above 0, the first this-many queued events belong to the current
+## session and the session is dropped once they are delivered (the mobile
+## background rule: game_exited goes out under the old session, then a new
+## one opens for game_started).
+var _session_boundary: int = 0
+## _now() when the oldest unsent event was queued, or -1.
+var _first_queued_at: float = -1.0
+var _reauth_attempts: int = 0
 
 var _backoff_seconds: float = DEFAULT_RETRY_SECONDS
-var _retry_timer: Timer
+## _now() at which the retry wait ends, or -1 when none is running.
+var _retry_at: float = -1.0
+## True when the running wait came from the server (Retry-After), which an
+## explicit flush() does not cut short.
+var _retry_from_server: bool = false
+
+var _started_queued: bool = false
+var _exit_queued: bool = false
+## Unix time the SDK was constructed: game_started's timestamp.
+var _start_unix: int = 0
+## Unix time the app went to the background on Android or iOS, or 0.
+var _backgrounded_at: int = 0
+
+var _status_reason: String = ""
+## The latest transient failure: "", "offline", "rate_limited" or
+## "session_failed". get_status_reason() reports it when nothing worse holds.
+var _transient_reason: String = ""
+var _logged_once: Dictionary = {}
 
 ## --- Quit handling --------------------------------------------------------------
 
 ## When true (the default), the SDK takes over the window close so the last
 ## events, including game_exited, can be sent: it sets the SceneTree's
 ## auto_accept_quit to false in _ready(), and on a close request it flushes,
-## then calls get_tree().quit() itself once the flush is answered or after
+## then quits once the flush is answered or after
 ## QUIT_FLUSH_TIMEOUT_SECONDS, whichever comes first. The Android back
 ## button is handled the same way when the project's
 ## application/config/quit_on_go_back setting is on. Set this to false
-## the same way as api_url (before the autoload is ready) if your game manages
-## quitting itself, e.g. with a confirm dialog; the SDK then only tracks
-## game_exited and flushes, and your own code calls get_tree().quit(). It is
-## also treated as false when auto_accept_quit is already off at _ready().
+## before the autoload is ready if your game manages the window close
+## itself, e.g. with a confirm dialog; the SDK then queues game_exited and
+## flushes on a close request, and your game quits with Ravensight.quit().
+## It is also treated as false when auto_accept_quit is already off at
+## _ready().
 @export var handle_quit: bool = true
 
 ## Longest the SDK delays a quit while it waits for the final flush.
@@ -132,72 +209,106 @@ const QUIT_FLUSH_TIMEOUT_SECONDS: float = 1.5
 var _owns_close_quit: bool = false
 ## True when the SDK owns the Android back button quit (see handle_quit).
 var _owns_go_back_quit: bool = false
-## Set once a close request has started the flush then quit sequence.
+## Set once the flush then quit sequence has started.
 var _quitting: bool = false
 var _quit_called: bool = false
+var _quit_deadline: float = -1.0
+var _quit_exit_code: int = 0
 
 ## --- Playtest mode ------------------------------------------------------------
 ##
-## Set from RAVENSIGHT_PLAYTEST_TOKEN (or a --ravensight-playtest-token=
-## launch arg) when this run is being driven by the Ravensight CLI's
-## playtest runner. Empty in a normal player build, which never sends the
-## playtest header or tags below.
+## Set from RAVENSIGHT_PLAYTEST_TOKEN and RAVENSIGHT_PLAYTEST_RUN_ID (or the
+## --ravensight-playtest-token= and --ravensight-playtest-run-id= launch
+## args) when this run is driven by the Ravensight CLI's playtest runner.
+## Empty in a normal player build, which never sends the playtest header or
+## tags below.
 
-## The playtest auth token, sent as the X-Ravensight-Playtest header. Empty
-## outside a playtest run.
+## The playtest auth token, sent as the X-Ravensight-Playtest header on every
+## request. Empty outside a playtest run.
 var playtest_token := ""
 var _playtest_run_id: String = ""
 ## Tags merged into every tracked event's data while playtest_token is set;
 ## see set_playtest_context().
 var _playtest_tags := {}
-## Set when the server has permanently rejected this run's playtest token or
-## reports the job closed (see _is_fatal_playtest_reason()). Once true,
-## _start_session() refuses to POST /session again for the rest of the run,
-## and track_event()'s own fallback to start one is skipped too - otherwise
-## the very next tracked event (continuous, in a driven playtest run) would
-## reopen a session attempt with the same already-rejected token. Events
-## tracked while blocked simply stay queued; nothing flushes them, since no
-## session is ever established. Cleared only by a fresh set_playtest_
-## context() call, which represents a genuinely new attempt.
+## Set when the server has permanently rejected this run's playtest token,
+## reports the job closed, or a token arrived without a run id. Nothing is
+## sent for the rest of the run. Cleared only by a fresh
+## set_playtest_context() call, which is a genuinely new attempt.
 var _playtest_blocked: bool = false
+var _playtest_reason: String = ""
 
 ## --- Lifecycle ----------------------------------------------------------------
 
-func _ready() -> void:
+func _init() -> void:
+	_start_unix = _unix_now()
 	_apply_playtest_env()
-
 	if playtest_token.is_empty():
 		device_id = _load_or_create_device_id()
-		# The player's opt-out is honoured before anything can queue or send
-		# an event. A playtest run ignores it: that traffic is the studio's
-		# own synthetic run under a throwaway identity, and a flag left on a
-		# developer's machine must not silently empty a paid run.
-		_player_opted_out = FileAccess.file_exists(OPTOUT_PATH)
-		tracking_enabled = not _player_opted_out
-	else:
-		# A playtest run gets a throwaway id derived from its run id and is
-		# never persisted: it must never be confused with, or pollute, a
-		# real player's device_id.save history.
-		device_id = "pt-" + _playtest_run_id
+		# Read now, so a track_event() or set_tracking_enabled() from an
+		# earlier autoload already sees the player's choice.
+		_player_opted_out = FileAccess.file_exists(_path(OPTOUT_PATH))
 
-	_retry_timer = Timer.new()
-	_retry_timer.one_shot = true
-	add_child(_retry_timer)
-	_retry_timer.timeout.connect(_on_retry_timer_timeout)
-
+func _ready() -> void:
+	# Keep the timers running while the game is paused, so a paused game
+	# still sends and still quits.
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	_take_over_quit()
+	_is_ready = true
 
+	_send_exit_marker_if_any()
+
+	if _playtest_blocked:
+		_clear_queue()
+		_update_reason()
+		return
+	if not enabled:
+		_clear_queue()
+		print("Ravensight: disabled for this run (enabled = false)")
+		_update_reason()
+		tracking_disabled.emit("init")
+		return
 	if _player_opted_out:
-		# Nothing leaves the device, not even the settings check.
+		# Nothing leaves the device, not even the settings check, and
+		# anything an earlier autoload tracked is dropped.
+		_clear_queue()
 		print("Ravensight: tracking disabled by player opt-out")
+		_update_reason()
 		tracking_disabled.emit("player")
-	else:
+		return
+	_activate()
+
+func _process(_delta: float) -> void:
+	_tick()
+
+## Runs the timers: the retry wait, the batching window and the quit
+## deadline. Called every frame.
+func _tick() -> void:
+	var t := _now()
+	if _retry_at >= 0.0 and t >= _retry_at:
+		_retry_at = -1.0
+		_retry_from_server = false
+		_flush_pending()
+	if _retry_at < 0.0 and _first_queued_at >= 0.0 and t - _first_queued_at >= flush_interval:
+		_flush_pending()
+	if _quitting and _quit_deadline >= 0.0 and t >= _quit_deadline:
+		_finish_quit()
+
+## Starts tracking once the SDK is ready and active: queues game_started
+## (once per run) and runs the kill switch check if it has not run.
+func _activate() -> void:
+	if not _is_ready or not _is_active():
+		return
+	_update_reason()
+	_queue_game_started(true)
+	if not _settings_checked:
 		_check_server_settings()
+	else:
+		_flush_pending()
 
 ## Godot quits the moment a close request arrives while auto_accept_quit is
 ## on, which leaves no time to send anything. Unless the game opted out (see
-## handle_quit), the SDK turns that off and calls quit() itself after the
-## final flush. The Android back button quits through a separate switch,
+## handle_quit), the SDK turns that off and quits itself after the final
+## flush. The Android back button quits through a separate switch,
 ## quit_on_go_back, so it is taken over only when the project has it on.
 func _take_over_quit() -> void:
 	var tree := get_tree()
@@ -213,54 +324,139 @@ func _notification(what: int) -> void:
 	match what:
 		NOTIFICATION_WM_CLOSE_REQUEST:
 			if _owns_close_quit:
-				_flush_then_quit()
+				_flush_then_quit(0)
 			else:
 				_track_exit_and_flush()
 		NOTIFICATION_WM_GO_BACK_REQUEST:
 			if _owns_go_back_quit:
-				_flush_then_quit()
+				_flush_then_quit(0)
 			else:
 				# The back button does not quit this project: just send what
 				# is queued, in case the app is about to be backgrounded.
-				_flush_pending()
-		NOTIFICATION_APPLICATION_PAUSED, NOTIFICATION_APPLICATION_FOCUS_OUT:
-			# Mobile can suspend or kill a backgrounded app without another
-			# notification, so send what is queued while there is a chance.
-			_flush_pending()
+				_flush_pending(true)
+		NOTIFICATION_APPLICATION_PAUSED:
+			if _is_mobile():
+				_on_backgrounded()
+			else:
+				_flush_pending(true)
+		NOTIFICATION_APPLICATION_RESUMED:
+			if _is_mobile():
+				_on_foregrounded()
+		NOTIFICATION_APPLICATION_FOCUS_OUT:
+			# Focus loss is not an exit: nothing is queued, the queue is sent.
+			_flush_pending(true)
 
-## The game manages quitting itself: record the exit and send it, best effort.
-## Whether it arrives depends on how soon the game's own quit() follows.
+## Quits the game after sending game_exited and the queue, holding the quit
+## at most QUIT_FLUSH_TIMEOUT_SECONDS. Call it from your own Quit button
+## instead of get_tree().quit(); it works whatever handle_quit is.
+func quit(exit_code: int = 0) -> void:
+	_flush_then_quit(exit_code)
+
+## The game manages the window close itself: record the exit and send it,
+## best effort. The game's own Ravensight.quit() follows.
 func _track_exit_and_flush() -> void:
-	if not tracking_enabled:
-		return
-	_enqueue_and_emit("game_exited", {})
-	_flush_pending()
+	_queue_game_exited()
+	_flush_pending(true)
 
 ## Records game_exited, sends the queue and quits when that flush is answered
 ## or after QUIT_FLUSH_TIMEOUT_SECONDS, whichever comes first. A flush already
 ## in flight is not interrupted: game_exited is queued behind it and sent by
 ## the follow-up flush that a successful response starts.
-func _flush_then_quit() -> void:
+func _flush_then_quit(exit_code: int) -> void:
 	if _quitting:
 		return
 	_quitting = true
-	if tracking_enabled:
-		_enqueue_and_emit("game_exited", {})
-	var can_send := _is_session_valid() or _session_request_pending
-	if not tracking_enabled or pending_events.is_empty() or not can_send:
+	_quit_exit_code = exit_code
+	_queue_game_exited()
+	if not _is_ready or not _is_active() or pending_events.is_empty():
 		_finish_quit()
 		return
-	# Ignore time scale and pause, so a paused or slowed game still quits.
-	get_tree().create_timer(QUIT_FLUSH_TIMEOUT_SECONDS, true, false, true).timeout.connect(_finish_quit)
-	# A no-op while a flush is in flight or the session is still being
-	# opened; the response handlers carry on from there.
-	_flush_pending()
+	_flush_pending(true)
+	if not (_flush_in_progress or _session_request_pending):
+		# Nothing could go out (no session and none could be opened).
+		_finish_quit()
+		return
+	_quit_deadline = _now() + QUIT_FLUSH_TIMEOUT_SECONDS
 
 func _finish_quit() -> void:
 	if _quit_called:
 		return
 	_quit_called = true
-	get_tree().quit()
+	_quit_tree(_quit_exit_code)
+
+func _quit_tree(exit_code: int) -> void:
+	get_tree().quit(exit_code)
+
+## --- Mobile background (Android and iOS) -------------------------------------
+
+func _is_mobile() -> bool:
+	return OS.has_feature("android") or OS.has_feature("ios")
+
+## The app went to the background. Mobile may kill it there without another
+## notification, so the queue is sent now and a small marker is saved: if
+## the app never comes back, the next launch reports game_exited for this
+## session from the marker. No event is queued.
+func _on_backgrounded() -> void:
+	if not _is_ready or not _is_active():
+		return
+	_backgrounded_at = _unix_now()
+	_flush_pending(true)
+	if playtest_token.is_empty() and not session_token.is_empty():
+		_write_text(BACKGROUND_MARKER_PATH, JSON.stringify({
+			"sessionToken": session_token,
+			"expiresAt": session_expires_at,
+			"backgroundedAt": _backgrounded_at,
+		}))
+
+## Back in the foreground. Under session_timeout nothing happens. At or past
+## it, the old session ends with game_exited at the moment the app went to
+## the background, and a new one starts with game_started now.
+func _on_foregrounded() -> void:
+	# A resume delivered before _ready() is the launch itself: the marker
+	# from an earlier run is _ready()'s to read.
+	if not _is_ready:
+		return
+	_remove_file(BACKGROUND_MARKER_PATH)
+	var backgrounded_at := _backgrounded_at
+	_backgrounded_at = 0
+	if backgrounded_at <= 0 or not _is_active():
+		return
+	if float(_unix_now() - backgrounded_at) < session_timeout:
+		return
+	_queue_game_exited(backgrounded_at)
+	# Everything queued so far belongs to the old session; once it is
+	# delivered the session is dropped and a new one opens.
+	_session_boundary = pending_events.size()
+	_started_queued = false
+	_exit_queued = false
+	_queue_game_started(false)
+	_flush_pending(true)
+
+## On launch: a marker left by a run that was killed in the background
+## reports that run's game_exited, one attempt, then the marker is deleted
+## whatever the answer.
+func _send_exit_marker_if_any() -> void:
+	if not playtest_token.is_empty():
+		return
+	var text := _read_text(BACKGROUND_MARKER_PATH)
+	if text.is_empty():
+		return
+	_remove_file(BACKGROUND_MARKER_PATH)
+	if not enabled or _player_opted_out:
+		return
+	var marker = JSON.parse_string(text)
+	if not (marker is Dictionary):
+		return
+	var token := str(marker.get("sessionToken", ""))
+	var expires_at := int(marker.get("expiresAt", 0))
+	var backgrounded_at := int(marker.get("backgroundedAt", 0))
+	if token.is_empty() or backgrounded_at <= 0 or _unix_now() >= expires_at:
+		return
+	var body := JSON.stringify({"events": [{"event": "game_exited", "data": {}, "timestamp": backgrounded_at}]})
+	_send("POST", "/track/batch", ["Content-Type: application/json", "X-Session-Token: " + token], body, _ignore_response)
+
+func _ignore_response(_code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
+	pass
 
 ## --- Device ID persistence ----------------------------------------------------
 
@@ -271,16 +467,11 @@ func _load_or_create_device_id() -> String:
 	# derived from the hardware or OS install; such an id is replaced with a
 	# fresh random one (and saved) so an upgraded install carries no hardware
 	# identifier either. That install starts a new analytics identity.
-	if FileAccess.file_exists(DEVICE_ID_PATH):
-		var file := FileAccess.open(DEVICE_ID_PATH, FileAccess.READ)
-		if file:
-			var saved_id := file.get_as_text().strip_edges()
-			file.close()
-			if _is_random_device_id(saved_id):
-				return saved_id
-
+	var saved_id := _read_text(DEVICE_ID_PATH).strip_edges()
+	if _is_random_device_id(saved_id):
+		return saved_id
 	var new_id := _generate_device_id()
-	_save_device_id(new_id)
+	_write_text(DEVICE_ID_PATH, new_id)
 	return new_id
 
 ## True when `id` has the shape _generate_device_id() produces: exactly 32
@@ -292,42 +483,128 @@ func _is_random_device_id(id: String) -> bool:
 	pattern.compile("^[0-9a-f]{32}-[a-z0-9]+$")
 	return pattern.search(id) != null
 
-## A new device id: 16 random bytes as lowercase hex, a dash, and the
-## lowercased OS name (kept because the per-OS split in analytics reads it),
-## e.g. "3f1c...9a-windows". It identifies this install of this game and
-## nothing else.
-##
-## Earlier versions built the id from OS.get_unique_id(), a value derived
-## from the device's hardware or OS install. The product promises a random
-## device id with no hardware identifier, so that is gone. No id, old or
+## A new device id: 16 random bytes from the platform's secure random source
+## as lowercase hex, a dash, and the lowercased OS name (kept because the
+## per-OS split in analytics reads it), e.g. "3f1c...9a-windows". It
+## identifies this install of this game and nothing else. No id, old or
 ## new, was ever linked to an account: Ravensight has no player accounts.
 func _generate_device_id() -> String:
 	var random_bytes := Crypto.new().generate_random_bytes(16)
 	return "%s-%s" % [random_bytes.hex_encode(), OS.get_name().to_lower()]
 
-func _save_device_id(id: String) -> void:
-	var file := FileAccess.open(DEVICE_ID_PATH, FileAccess.WRITE)
+## --- Storage --------------------------------------------------------------------
+
+## Where the SDK's files live. Tests point this somewhere else.
+func _storage_dir() -> String:
+	return "user://"
+
+func _path(user_path: String) -> String:
+	return _storage_dir() + user_path.trim_prefix("user://")
+
+func _read_text(user_path: String) -> String:
+	var p := _path(user_path)
+	if not FileAccess.file_exists(p):
+		return ""
+	var file := FileAccess.open(p, FileAccess.READ)
+	if file == null:
+		return ""
+	var text := file.get_as_text()
+	file.close()
+	return text
+
+func _write_text(user_path: String, text: String) -> void:
+	var file := FileAccess.open(_path(user_path), FileAccess.WRITE)
 	if file:
-		file.store_string(id)
+		file.store_string(text)
 		file.close()
+
+func _remove_file(user_path: String) -> void:
+	var p := _path(user_path)
+	if FileAccess.file_exists(p):
+		DirAccess.remove_absolute(p)
+
+## --- Clocks and transport (replaced in tests) -------------------------------------
+
+## Monotonic seconds, for timers.
+func _now() -> float:
+	return Time.get_ticks_msec() / 1000.0
+
+## Unix seconds, for event timestamps and session expiry.
+func _unix_now() -> int:
+	return int(Time.get_unix_time_from_system())
+
+## Every request the SDK makes goes through here. `path` is relative to
+## api_base(); `callback` is called with (status, headers, body), where
+## status is 0 for a network failure or a timeout.
+func _send(method: String, path: String, headers: Array, body: String, callback: Callable) -> void:
+	var http := HTTPRequest.new()
+	http.timeout = REQUEST_TIMEOUT_SECONDS
+	add_child(http)
+	http.request_completed.connect(func(result: int, code: int, response_headers: PackedStringArray, response_body: PackedByteArray) -> void:
+		http.queue_free()
+		var status := code if result == HTTPRequest.RESULT_SUCCESS else 0
+		callback.call(status, response_headers, response_body))
+	var http_method := HTTPClient.METHOD_POST if method == "POST" else HTTPClient.METHOD_GET
+	var err := http.request(api_base() + path, PackedStringArray(headers), http_method, body)
+	if err != OK:
+		http.queue_free()
+		callback.call_deferred(0, PackedStringArray(), PackedByteArray())
+
+## The API root every request goes to: api_url with surrounding whitespace,
+## every trailing "/" and a trailing "/api/v1" removed, then "/api/v1"
+## appended. Empty means https://api.ravensight.io.
+func api_base() -> String:
+	var base := api_url.strip_edges()
+	while base.ends_with("/"):
+		base = base.substr(0, base.length() - 1)
+	if base.ends_with("/api/v1"):
+		base = base.substr(0, base.length() - "/api/v1".length())
+		while base.ends_with("/"):
+			base = base.substr(0, base.length() - 1)
+	if base.is_empty():
+		base = "https://api.ravensight.io"
+	return base + "/api/v1"
+
+func _key_headers() -> Array:
+	var headers := ["X-API-Key: " + ingest_key]
+	if not playtest_token.is_empty():
+		headers.append("X-Ravensight-Playtest: " + playtest_token)
+	return headers
+
+func _session_headers() -> Array:
+	var headers := ["Content-Type: application/json", "X-Session-Token: " + session_token]
+	if not playtest_token.is_empty():
+		headers.append("X-Ravensight-Playtest: " + playtest_token)
+	return headers
 
 ## --- Playtest mode setup --------------------------------------------------------
 
 ## Reads RAVENSIGHT_PLAYTEST_TOKEN/RUN_ID/JOB_ID/PERSONA from the environment
 ## (set by the Ravensight CLI's playtest runner before it launches the game),
-## or a --ravensight-playtest-token= user arg for the token, and applies them
-## the same way set_playtest_context() would. A no-op when none are present,
-## which is every normal player build.
+## or the --ravensight-playtest-token= and --ravensight-playtest-run-id=
+## user args, and applies them the same way set_playtest_context() would.
+## A token without a run id never runs as a real player: the run is stopped.
+## A no-op when no token is present, which is every normal player build.
 func _apply_playtest_env() -> void:
 	var token := OS.get_environment("RAVENSIGHT_PLAYTEST_TOKEN")
 	if token.is_empty():
 		token = _get_cmdline_arg_value("ravensight-playtest-token")
 	if token.is_empty():
 		return
+	var run_id := OS.get_environment("RAVENSIGHT_PLAYTEST_RUN_ID")
+	if run_id.is_empty():
+		run_id = _get_cmdline_arg_value("ravensight-playtest-run-id")
+	if run_id.is_empty():
+		playtest_token = token
+		device_id = ""
+		_playtest_blocked = true
+		_playtest_reason = "session_failed"
+		_log_once("playtest_no_run", "Ravensight: playtest token without a run id, nothing will be sent this run", true)
+		return
 
 	set_playtest_context({
 		"token": token,
-		"run_id": OS.get_environment("RAVENSIGHT_PLAYTEST_RUN_ID"),
+		"run_id": run_id,
 		"job_id": OS.get_environment("RAVENSIGHT_PLAYTEST_JOB_ID"),
 		"persona": OS.get_environment("RAVENSIGHT_PLAYTEST_PERSONA"),
 	})
@@ -339,12 +616,13 @@ func _get_cmdline_arg_value(arg_name: String) -> String:
 			return arg.substr(prefix.length())
 	return ""
 
-## Switches this SDK instance into playtest mode: sessions are opened with
-## the playtest header and platform, device_id becomes a throwaway id that is
-## never persisted, and every tracked event is tagged as synthetic. Called
-## automatically at boot from the RAVENSIGHT_PLAYTEST_* environment (see
-## _apply_playtest_env()); call it directly if you wire a driver up some
-## other way, e.g. attaching to an already-running game.
+## Switches this SDK instance into playtest mode: every request carries the
+## playtest header, sessions use the playtest platform, device_id becomes
+## "pt-<run_id>" (never read from or written to disk), the player's saved
+## opt-out is ignored, and every tracked event is tagged as synthetic.
+## Called automatically when the SDK is constructed from the
+## RAVENSIGHT_PLAYTEST_* environment (see _apply_playtest_env()); call it
+## directly if you wire a driver up some other way.
 ##
 ## ctx keys: "token" and "run_id" are required; "job_id", "persona" and
 ## "tier" are optional (persona/job_id default to "", tier defaults to
@@ -363,11 +641,10 @@ func set_playtest_context(ctx: Dictionary) -> void:
 	# A fresh context is a fresh attempt, even if the previous one ended in
 	# a fatal rejection.
 	_playtest_blocked = false
-	# A playtest run ignores the player's opt-out (see _ready()); the flag
-	# on disk is left exactly as the player set it.
-	if _player_opted_out:
-		_player_opted_out = false
-		tracking_enabled = _server_tracking_enabled
+	_playtest_reason = ""
+	# A playtest run ignores the player's opt-out; the flag on disk is left
+	# exactly as the player set it.
+	_player_opted_out = false
 
 	_playtest_tags = {
 		"synthetic": true,
@@ -380,78 +657,74 @@ func set_playtest_context(ctx: Dictionary) -> void:
 
 	var had_session := not session_token.is_empty() or _session_request_pending
 	if had_session:
-		session_token = ""
-		session_expires_at = 0
-		# If a session request for the old identity is still in flight,
-		# clearing _session_request_pending here lets _start_session()'s
-		# own re-entrancy guard pass so a new request goes out immediately.
-		# That new request bumps _session_request_generation, so when the
-		# stale one eventually completes, _on_session_response() sees an
-		# outdated generation and ignores it instead of racing the new
-		# session into session_token.
-		_session_request_pending = false
+		# Dropping bumps the generation, so a response for the old identity
+		# still in flight is ignored when it lands.
+		_drop_session()
 		_start_session()
+	elif _is_ready:
+		_activate()
+
+## True in a run driven by the Ravensight playtest runner.
+func is_playtest() -> bool:
+	return not playtest_token.is_empty()
 
 ## --- Server kill switch (GET /api/v1/settings) ---------------------------------
 
 func _check_server_settings() -> void:
-	var http := HTTPRequest.new()
-	add_child(http)
-	http.request_completed.connect(_on_settings_response.bind(http))
+	if not _is_ready or not _is_active() or _settings_pending:
+		return
+	_settings_pending = true
+	_send("GET", "/settings", _key_headers(), "", _on_settings_response)
 
-	var headers := ["X-API-Key: " + ingest_key]
-	var err := http.request(api_url + "/api/v1/settings", headers, HTTPClient.METHOD_GET)
-	if err != OK:
-		push_warning("Ravensight: settings check failed to start (error %d); assuming tracking enabled" % err)
-		http.queue_free()
-		_after_settings_checked()
-
-func _on_settings_response(_result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray, http: HTTPRequest) -> void:
-	http.queue_free()
-
-	if response_code == 200:
+func _on_settings_response(code: int, headers: PackedStringArray, body: PackedByteArray) -> void:
+	_settings_pending = false
+	_settings_checked = true
+	var error := _extract_error(body, "")
+	if code == 200:
 		var parsed = _parse_json(body)
-		if parsed is Dictionary and parsed.has("trackingEnabled"):
-			_server_tracking_enabled = bool(parsed["trackingEnabled"])
+		if parsed is Dictionary and parsed.has("trackingEnabled") and not bool(parsed["trackingEnabled"]):
+			_on_server_tracking_disabled()
+			return
+	elif code == 403 and error == "tracking_disabled":
+		_on_server_tracking_disabled()
+		return
+	elif code == 403 and _is_fatal_playtest_error(error):
+		_on_playtest_refused(error)
+		return
+	elif code == 401 or code == 403:
+		_refuse_key()
+		return
+	elif code == 429 or (code == 503 and _extract_retry_after(headers) >= 0.0):
+		# The kill switch is assumed on; the session waits the server's time.
+		_transient_reason = "rate_limited"
+		_update_reason()
+		_schedule_retry(_extract_retry_after(headers))
+		return
 	else:
-		push_warning("Ravensight: could not fetch settings (HTTP %d); assuming tracking enabled" % response_code)
-
-	_after_settings_checked()
-
-func _after_settings_checked() -> void:
-	# The server switch wins when it says off, and so does the player's
-	# opt-out. Both have to be on for anything to be sent.
-	tracking_enabled = _server_tracking_enabled and not _player_opted_out
-	if not _server_tracking_enabled:
-		print("Ravensight: tracking disabled by server kill switch")
-		tracking_disabled.emit("server")
-	elif tracking_enabled:
-		# Kicks off session creation as a side effect of enqueuing the event.
-		track_event("game_started", {})
+		_log_once("settings_failed", "Ravensight: could not fetch settings (HTTP %d); assuming tracking enabled" % code, false)
+	_flush_pending()
 
 ## --- Session management (POST /api/v1/session) ---------------------------------
 
 func _is_session_valid() -> bool:
-	return session_token.length() > 0 and Time.get_unix_time_from_system() < session_expires_at
+	return session_token.length() > 0 and _unix_now() < session_expires_at
 
-func _start_session() -> void:
-	# A previous attempt was fatally rejected (bad/expired playtest token, or
-	# a closed job) - never POST /session again for the rest of this run.
-	# Only a fresh set_playtest_context() call clears this.
-	if _playtest_blocked:
+## Opens a session unless one is open or opening, nothing may be sent, or a
+## wait is running. `explicit` (flush(), quit, background) cuts a backoff
+## wait short and makes one more attempt after a refused key; a server's
+## Retry-After wait always holds.
+func _start_session(explicit: bool = false) -> void:
+	if not _is_ready or not _is_active() or not _settings_checked:
 		return
-	# Opted out or killed server-side: no session is ever opened.
-	if not tracking_enabled:
+	if _session_request_pending or device_id.is_empty():
 		return
-	if _session_request_pending:
+	if _key_refused and not explicit:
+		return
+	if not _can_send_now(explicit):
 		return
 	_session_request_pending = true
 	_session_request_generation += 1
 	var generation := _session_request_generation
-
-	var http := HTTPRequest.new()
-	add_child(http)
-	http.request_completed.connect(_on_session_response.bind(http, generation))
 
 	var headers := ["Content-Type: application/json", "X-API-Key: " + ingest_key]
 	var platform := OS.get_name()
@@ -464,127 +737,161 @@ func _start_session() -> void:
 		"gameVersion": game_version,
 		"platform": platform,
 	})
+	_send("POST", "/session", headers, body, _on_session_response.bind(generation))
 
-	var err := http.request(api_url + "/api/v1/session", headers, HTTPClient.METHOD_POST, body)
-	if err != OK:
-		_session_request_pending = false
-		http.queue_free()
-		push_error("Ravensight: failed to start session request (error %d)" % err)
-		_schedule_retry()
-
-func _on_session_response(_result: int, response_code: int, headers: PackedStringArray, body: PackedByteArray, http: HTTPRequest, generation: int) -> void:
-	http.queue_free()
-
-	# A newer session attempt has started since this request went out (e.g.
-	# set_playtest_context() switched identity mid-flight). This response
-	# describes an identity we've already abandoned - ignore it entirely
-	# rather than letting it clear the newer request's pending flag or,
-	# worse, overwrite session_token/session_expires_at with a session the
-	# server never tagged as synthetic while queued events already carry
-	# playtest tags.
+func _on_session_response(code: int, headers: PackedStringArray, body: PackedByteArray, generation: int) -> void:
+	# A newer session attempt has started (or the session was dropped) since
+	# this request went out. Ignore it rather than let it overwrite state.
 	if generation != _session_request_generation:
 		return
-
 	_session_request_pending = false
+	var error := _extract_error(body, "")
 
-	if response_code == 201:
+	if code == 201:
 		var parsed = _parse_json(body)
 		if parsed is Dictionary and parsed.has("token"):
 			session_token = str(parsed["token"])
 			# The server sends expiresIn (seconds) and expiresAt (an ISO
 			# string, which int() would mangle). expiresIn is the contract.
 			var expires_in := int(parsed.get("expiresIn", 86400))
-			session_expires_at = int(Time.get_unix_time_from_system()) + expires_in
-
+			session_expires_at = _unix_now() + expires_in
 			_backoff_seconds = DEFAULT_RETRY_SECONDS
+			_key_refused = false
+			_transient_reason = ""
+			_update_reason()
 			print("Ravensight: session ready")
 			session_ready.emit()
 			_flush_pending()
 		else:
 			push_error("Ravensight: malformed session response")
+			_transient_reason = "session_failed"
+			_update_reason()
 			session_failed.emit("malformed_response")
 			_schedule_retry()
-	elif response_code == 429:
-		var reason := _extract_error(body, "rate_limited")
-		push_warning("Ravensight: session creation rate-limited (%s)" % reason)
-		session_failed.emit(reason)
-		_schedule_retry(_extract_retry_after(headers))
-	elif response_code == 403 and _is_fatal_playtest_reason(body):
-		var reason3 := _extract_error(body, "http_403")
-		# The playtest token is bad or the job has already closed: neither
-		# resolves itself. Skipping _schedule_retry() only stops the timer-
-		# driven retry; track_event()'s and _start_session()'s own
-		# fallbacks would otherwise reopen a session on the very next
-		# tracked event, so set the persistent guard too - see
-		# _playtest_blocked.
-		_playtest_blocked = true
-		push_error("Ravensight: playtest session refused (%s)" % reason3)
-		session_failed.emit(reason3)
-	elif response_code == 403 and _is_tracking_disabled_reason(body):
-		# The kill switch went off after boot (the server refuses new
-		# sessions for a disabled game). Retrying can never succeed, so this
-		# ends tracking for the run; see _on_server_tracking_disabled().
+	elif code == 403 and error == "tracking_disabled":
 		session_failed.emit("tracking_disabled")
 		_on_server_tracking_disabled()
 		return
+	elif code == 403 and _is_fatal_playtest_error(error):
+		session_failed.emit(error)
+		_on_playtest_refused(error)
+		return
+	elif code == 401 or code == 403:
+		session_failed.emit("invalid_key")
+		_refuse_key()
+	elif code == 429 or (code == 503 and _extract_retry_after(headers) >= 0.0):
+		var reason := error if not error.is_empty() else "rate_limited"
+		push_warning("Ravensight: session creation rate-limited (%s)" % reason)
+		_transient_reason = "rate_limited"
+		_update_reason()
+		session_failed.emit(reason)
+		_schedule_retry(_extract_retry_after(headers))
 	else:
-		var reason2 := _extract_error(body, "http_%d" % response_code)
-		push_error("Ravensight: session creation failed (HTTP %d)" % response_code)
+		var reason2 := error if not error.is_empty() else ("offline" if code == 0 else "http_%d" % code)
+		push_warning("Ravensight: session creation failed (%s)" % reason2)
+		_transient_reason = "offline" if code == 0 else "session_failed"
+		_update_reason()
 		session_failed.emit(reason2)
 		_schedule_retry()
 
 	# Quitting and no session came of it: nothing more can be sent.
-	if _quitting and response_code != 201:
+	if _quitting and code != 201:
 		_finish_quit()
 
 ## --- Retry / backoff ------------------------------------------------------------
 
-func _schedule_retry(explicit_wait_seconds: float = -1.0) -> void:
-	var wait := explicit_wait_seconds if explicit_wait_seconds > 0.0 else _backoff_seconds
-	_backoff_seconds = min(_backoff_seconds * 2.0, MAX_BACKOFF_SECONDS)
-
-	_retry_timer.stop()
-	_retry_timer.wait_time = max(wait, 0.5)
-	_retry_timer.start()
-
-func _on_retry_timer_timeout() -> void:
-	if not tracking_enabled:
-		return
-	if not _is_session_valid():
-		_start_session()
+## Waits before the next automatic attempt: `server_wait_seconds` exactly
+## when the server gave one (Retry-After), otherwise the backoff, which
+## starts at 10 seconds and doubles up to 5 minutes.
+func _schedule_retry(server_wait_seconds: float = -1.0) -> void:
+	var wait := _backoff_seconds
+	if server_wait_seconds >= 0.0:
+		wait = server_wait_seconds
+		_retry_from_server = true
 	else:
-		_flush_pending()
+		_backoff_seconds = minf(_backoff_seconds * 2.0, MAX_BACKOFF_SECONDS)
+		_retry_from_server = false
+	_retry_at = _now() + wait
+
+func _stop_retry() -> void:
+	_retry_at = -1.0
+	_retry_from_server = false
+
+func _can_send_now(explicit: bool) -> bool:
+	if _retry_at < 0.0:
+		return true
+	if _retry_from_server:
+		return false
+	return explicit
 
 ## --- Public API: event tracking --------------------------------------------------
 
-## Queue an event for delivery. Events are flushed in batches (up to 50 at a
-## time) via POST /api/v1/track/batch as soon as a valid session is available.
-## Safe to call before the session is ready: events are queued and sent once
-## the session is established (or once tracking is confirmed enabled).
+## Queue an event. It is sent with others: flush_interval seconds after the
+## first waiting event, at once when 50 are waiting, on flush(), when the
+## app goes to the background, and on quit. Safe to call from any autoload,
+## even before this one is ready: such events wait for the opt-out and kill
+## switch checks.
 func track_event(event_name: String, data: Dictionary = {}) -> void:
-	if not tracking_enabled:
+	if not _is_active():
 		return
-
 	_enqueue_and_emit(event_name, data)
-
-	# A retry or backoff wait is running: leave the event queued and let the
-	# timer send it. Flushing (or reopening a session) on every tracked event
-	# would defeat the backoff, including a server's Retry-After.
-	if _retry_timer != null and not _retry_timer.is_stopped():
+	if not _is_ready:
 		return
-
-	if _is_session_valid():
+	if pending_events.size() >= MAX_BATCH_SIZE:
 		_flush_pending()
-	elif not _session_request_pending and not _playtest_blocked:
-		# _playtest_blocked means an earlier fatal rejection already killed
-		# this run's session attempts; leave the event queued rather than
-		# reopening a request with the same rejected token.
-		_start_session()
 
-## Force an immediate flush attempt of any queued events (no-op if none are
-## queued, no session is ready yet, or a flush is already in flight).
+## Send what is queued now instead of waiting for the timer. Cuts a backoff
+## wait short and, after the ingest key was refused, makes one more
+## attempt; a server's Retry-After wait still holds.
 func flush() -> void:
-	_flush_pending()
+	_flush_pending(true)
+
+## --- Public API: status ----------------------------------------------------------
+
+## Why the SDK is not sending, or "" when nothing is wrong (a session is open
+## or opening normally). One of "disabled" (enabled is false or the player
+## opted out), "invalid_key", "tracking_disabled" (the server kill switch),
+## "offline", "rate_limited", "session_failed", "playtest_job_closed".
+## status_changed fires whenever it changes.
+func get_status_reason() -> String:
+	return _status_reason
+
+func _update_reason() -> void:
+	var reason := _transient_reason
+	if not enabled or _player_opted_out:
+		reason = "disabled"
+	elif _killed:
+		reason = "tracking_disabled"
+	elif _playtest_blocked:
+		reason = _playtest_reason if not _playtest_reason.is_empty() else "session_failed"
+	elif _key_refused:
+		reason = "invalid_key"
+	if reason != _status_reason:
+		_status_reason = reason
+		status_changed.emit(reason)
+
+func _is_active() -> bool:
+	return enabled and not _player_opted_out and not _killed and not _playtest_blocked
+
+## --- Public API: switching the SDK on and off ------------------------------------
+
+## The game's own switch for this run, never saved (see `enabled`). false
+## drops the queue and stops every request; true starts again, running the
+## kill switch check and sending game_started if they have not run yet.
+func set_enabled(value: bool) -> void:
+	if value == enabled:
+		return
+	enabled = value
+	if not _is_ready:
+		return
+	if not value:
+		_clear_queue()
+		_stop_retry()
+		_update_reason()
+		tracking_disabled.emit("init")
+	else:
+		_update_reason()
+		_activate()
 
 ## --- Public API: player privacy -------------------------------------------------
 ##
@@ -592,64 +899,67 @@ func flush() -> void:
 ## privacy screen, or a settings toggle, wire it to the two calls below.
 
 ## Turns tracking off or on for this player and remembers the choice across
-## launches (a flag file at OPTOUT_PATH). While off: no session is opened,
-## track_event() drops the event, anything already queued is discarded, and
-## nothing is sent, not even the settings check on the next boot. Turning it
-## back on re-reads the server kill switch, which still wins when it says
-## off, then opens a new session and sends game_started as on boot.
-func set_tracking_enabled(enabled: bool) -> void:
-	# Turning on a player who never opted out changes nothing: tracking is
-	# already as on as the server allows, and re-running the boot sequence
-	# would send a second game_started.
-	if enabled and not _player_opted_out:
+## launches (a flag file at OPTOUT_PATH, written at once). Safe to call at
+## any time, even from an earlier autoload or while enabled is false. While
+## off: no session is opened, track_event() drops the event, anything
+## already queued is discarded, and nothing is sent, not even the settings
+## check on the next boot. Turning it back on starts again; game_started is
+## sent at most once per run. A no-op in a playtest run.
+func set_tracking_enabled(value: bool) -> void:
+	if not playtest_token.is_empty():
+		print("Ravensight: set_tracking_enabled() ignored in a playtest run")
 		return
-
-	_player_opted_out = not enabled
-	_write_optout_flag(_player_opted_out)
+	_write_optout_flag(not value)
+	if value != _player_opted_out:
+		# Already as asked.
+		return
+	_player_opted_out = not value
 
 	if _player_opted_out:
-		tracking_enabled = false
 		_drop_session()
 		_clear_queue()
-		_retry_timer.stop()
+		_stop_retry()
 		print("Ravensight: tracking disabled by player opt-out")
-		tracking_disabled.emit("player")
+		_update_reason()
+		# Before ready, _ready() announces it.
+		if _is_ready:
+			tracking_disabled.emit("player")
 	else:
-		_check_server_settings()
+		_update_reason()
+		_activate()
 
-## True when events are being collected: the player has not opted out and
-## the server kill switch is on. The same answer as reading tracking_enabled.
+## True when events are being collected: the SDK is enabled, the player has
+## not opted out, and the server kill switch is on. The same answer as
+## reading tracking_enabled.
 func is_tracking_enabled() -> bool:
-	return tracking_enabled
+	return _is_active()
 
-## Forgets this install's analytics identity: deletes the saved device id,
-## generates a fresh random one, and drops the current session token and the
-## in-memory queue, so the next tracked event opens a new session under the
+## Forgets this install's analytics identity: generates a fresh random
+## device id and saves it, and drops the current session and the queue, so
+## the next tracked event opens a new session under the new id. Returns the
 ## new id. Wire this to a "reset my analytics identity" setting if you offer
 ## one. Events already on the server stay under the old id, which nothing
 ## links back to this player. A no-op in a playtest run, whose id is a
 ## throwaway that is never saved.
-func reset_device_id() -> void:
+func reset_device_id() -> String:
 	if not playtest_token.is_empty():
-		return
-	DirAccess.remove_absolute(DEVICE_ID_PATH)
+		print("Ravensight: reset_device_id() ignored in a playtest run")
+		return device_id
 	device_id = _generate_device_id()
-	_save_device_id(device_id)
+	_write_text(DEVICE_ID_PATH, device_id)
 	_drop_session()
 	_clear_queue()
+	return device_id
 
 func _write_optout_flag(opted_out: bool) -> void:
 	if opted_out:
-		var file := FileAccess.open(OPTOUT_PATH, FileAccess.WRITE)
-		if file:
-			file.store_string("1")
-			file.close()
-	elif FileAccess.file_exists(OPTOUT_PATH):
-		DirAccess.remove_absolute(OPTOUT_PATH)
+		_write_text(OPTOUT_PATH, "1")
+	else:
+		_remove_file(OPTOUT_PATH)
 
 ## Ends the current session without touching the queue. Bumping the request
 ## generation makes _on_session_response() ignore any session request still
-## in flight for the old identity (see _session_request_generation).
+## in flight for the old identity.
 func _drop_session() -> void:
 	session_token = ""
 	session_expires_at = 0
@@ -665,37 +975,65 @@ func _clear_queue() -> void:
 	_queue_generation += 1
 	_flush_in_progress = false
 	_split_batch_size = 0
+	_session_boundary = 0
+	_first_queued_at = -1.0
 
-## The kill switch was turned off while the game is running: the server
-## refused a session with 403 tracking_disabled. Fatal for the rest of the
-## run, like the boot check saying off: nothing is queued, sent or retried
-## until set_tracking_enabled() re-reads the switch or the game restarts.
+## The kill switch is off (settings said so, or a 403 tracking_disabled):
+## final for the rest of the run. Nothing is queued, sent or retried.
 func _on_server_tracking_disabled() -> void:
-	_server_tracking_enabled = false
-	tracking_enabled = false
+	_killed = true
 	_drop_session()
 	_clear_queue()
-	_retry_timer.stop()
-	print("Ravensight: tracking disabled by server kill switch")
+	_stop_retry()
+	_log_once("killed", "Ravensight: tracking disabled by server kill switch", false)
+	_update_reason()
 	tracking_disabled.emit("server")
 	if _quitting:
 		_finish_quit()
 
-func _is_tracking_disabled_reason(body: PackedByteArray) -> bool:
-	return _extract_error(body, "") == "tracking_disabled"
+## The ingest key was refused. Retrying on a timer cannot fix that, so
+## automatic sending stops for the run; events keep queueing (the cap
+## applies) and an explicit flush() tries once more.
+func _refuse_key() -> void:
+	_key_refused = true
+	_stop_retry()
+	_log_once("invalid_key", INVALID_KEY_MESSAGE, true)
+	_update_reason()
+	if _quitting:
+		_finish_quit()
+
+## The playtest token is bad or the job has closed: neither resolves itself.
+func _on_playtest_refused(error: String) -> void:
+	_playtest_blocked = true
+	_playtest_reason = "playtest_job_closed" if error == "playtest_job_closed" else "session_failed"
+	_drop_session()
+	_clear_queue()
+	_stop_retry()
+	_log_once("playtest_refused", "Ravensight: playtest run refused (%s), nothing more will be sent" % error, true)
+	_update_reason()
+	if _quitting:
+		_finish_quit()
+
+func _is_fatal_playtest_error(error: String) -> bool:
+	return error == "invalid_playtest_token" or error == "playtest_job_closed"
+
+## --- Queue ---------------------------------------------------------------------------
 
 ## Queues the event and announces it on event_tracked with the data actually
 ## queued.
-func _enqueue_and_emit(event_name: String, data: Dictionary) -> void:
-	var queued_data := _enqueue(event_name, data)
+func _enqueue_and_emit(event_name: String, data: Dictionary, timestamp: int = -1, at_front: bool = false) -> void:
+	var queued_data := _enqueue(event_name, data, timestamp, at_front)
 	event_tracked.emit(event_name, queued_data)
 
 ## Queues the event and returns the data dictionary actually stored (a
-## tagged copy in a playtest run, the original otherwise), so callers such
-## as track_event() can mirror exactly what will be sent.
-func _enqueue(event_name: String, data: Dictionary) -> Dictionary:
-	if pending_events.size() >= max_queue_size:
-		pending_events.pop_front()  # drop oldest to make room for newest
+## tagged copy in a playtest run, the original otherwise).
+func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_front: bool = false) -> Dictionary:
+	while not pending_events.is_empty() and pending_events.size() >= max_queue_size:
+		# Drop the oldest, but keep a queued game_started at the front.
+		if pending_events.size() > 1 and str(pending_events[0].get("event", "")) == "game_started":
+			_remove_queued(1)
+		else:
+			_remove_queued(0)
 
 	var event_data := data
 	if not playtest_token.is_empty():
@@ -703,179 +1041,248 @@ func _enqueue(event_name: String, data: Dictionary) -> Dictionary:
 		event_data = data.duplicate()
 		event_data.merge(_playtest_tags, true)
 
-	pending_events.append({
+	var event := {
 		"event": event_name,
 		"data": event_data,
-		"timestamp": int(Time.get_unix_time_from_system()),
-	})
-
+		"timestamp": timestamp if timestamp >= 0 else _unix_now(),
+	}
+	if at_front:
+		pending_events.push_front(event)
+		if _session_boundary > 0:
+			_session_boundary += 1
+	else:
+		pending_events.append(event)
+	if _first_queued_at < 0.0:
+		_first_queued_at = _now()
 	return event_data
 
-func _flush_pending() -> void:
-	if not tracking_enabled:
+func _remove_queued(index: int) -> void:
+	pending_events.remove_at(index)
+	if index < _session_boundary:
+		_session_boundary -= 1
+
+## Drops the first `count` queued events (they were delivered or refused).
+## When that finishes the old session's share (see _session_boundary), the
+## session is dropped so the rest opens a new one.
+func _drop_front(count: int) -> void:
+	pending_events = pending_events.slice(count, pending_events.size())
+	if _session_boundary > 0:
+		_session_boundary = maxi(0, _session_boundary - count)
+		if _session_boundary == 0:
+			_drop_session()
+
+## game_started, once per session: first in the queue at boot, carrying the
+## time the SDK was constructed.
+func _queue_game_started(at_boot: bool) -> void:
+	if _started_queued or not _is_active():
 		return
-	if _flush_in_progress or pending_events.is_empty() or not _is_session_valid():
+	_started_queued = true
+	if at_boot:
+		_enqueue_and_emit("game_started", {}, _start_unix, true)
+	else:
+		_enqueue_and_emit("game_started", {})
+
+## game_exited, once.
+func _queue_game_exited(timestamp: int = -1) -> void:
+	if _exit_queued or not _is_active():
+		return
+	_exit_queued = true
+	_enqueue_and_emit("game_exited", {}, timestamp)
+
+## Sends the next batch, opening a session first when there is none.
+func _flush_pending(explicit: bool = false) -> void:
+	if not _is_ready or not _is_active():
+		return
+	if _flush_in_progress or pending_events.is_empty():
+		return
+	if not _is_session_valid():
+		_start_session(explicit)
+		return
+	if not _can_send_now(explicit):
+		return
+	if _key_refused and not explicit:
 		return
 	_flush_in_progress = true
+	_first_queued_at = -1.0
 
-	var batch_size: int = min(MAX_BATCH_SIZE, pending_events.size())
+	var batch_size: int = mini(MAX_BATCH_SIZE, pending_events.size())
 	if _split_batch_size > 0:
 		batch_size = mini(batch_size, _split_batch_size)
+	if _session_boundary > 0:
+		batch_size = mini(batch_size, _session_boundary)
 	var batch: Array = pending_events.slice(0, batch_size)
 
-	var http := HTTPRequest.new()
-	add_child(http)
-	http.request_completed.connect(_on_batch_response.bind(http, batch_size, _queue_generation))
+	_send("POST", "/track/batch", _session_headers(), JSON.stringify({"events": batch}),
+		_on_batch_response.bind(batch_size, _queue_generation))
 
-	var headers := ["Content-Type: application/json", "X-Session-Token: " + session_token]
-	var body := JSON.stringify({"events": batch})
-
-	var err := http.request(api_url + "/api/v1/track/batch", headers, HTTPClient.METHOD_POST, body)
-	if err != OK:
-		_flush_in_progress = false
-		http.queue_free()
-		push_error("Ravensight: failed to start batch flush (error %d)" % err)
-		_schedule_retry()
-
-func _on_batch_response(_result: int, response_code: int, headers: PackedStringArray, body: PackedByteArray, http: HTTPRequest, batch_size: int, generation: int) -> void:
-	http.queue_free()
-
+func _on_batch_response(code: int, headers: PackedStringArray, body: PackedByteArray, batch_size: int, generation: int) -> void:
 	# The queue this batch was taken from has been discarded since it went
 	# out (see _clear_queue()). Its events are gone, so slicing batch_size
 	# off the front now would drop events queued afterwards; the flag was
 	# already released by the clear.
 	if generation != _queue_generation:
 		return
-
 	_flush_in_progress = false
+	var error := _extract_error(body, "")
 
-	if response_code == 202:
-		pending_events = pending_events.slice(batch_size, pending_events.size())
+	if code == 202 or code == 200:
+		_drop_front(batch_size)
 		_backoff_seconds = DEFAULT_RETRY_SECONDS
 		_split_batch_size = 0
+		_reauth_attempts = 0
+		_key_refused = false
+		_transient_reason = ""
+		_update_reason()
 		events_flushed.emit(batch_size)
 		if not pending_events.is_empty():
-			call_deferred("_flush_pending")
-	elif response_code == 401:
-		# Session expired or was revoked; drop it and start a new one. Queued
-		# events are left in place and will be flushed once re-established.
-		push_warning("Ravensight: session invalid/expired, refreshing")
+			_flush_pending(_quitting)
+	elif code == 401:
+		# The session expired or was revoked. Queued events stay; a fresh
+		# session is opened, at most MAX_REAUTH_ATTEMPTS times in a row,
+		# then the backoff takes over.
 		session_token = ""
 		session_expires_at = 0
-		_start_session()
-	elif response_code == 403 and _is_tracking_disabled_reason(body):
+		_reauth_attempts += 1
+		if _reauth_attempts <= MAX_REAUTH_ATTEMPTS:
+			push_warning("Ravensight: session invalid or expired, refreshing")
+			_start_session(_quitting)
+		else:
+			flush_failed.emit(error if not error.is_empty() else "http_401")
+			_schedule_retry()
+	elif code == 403 and error == "tracking_disabled":
 		_on_server_tracking_disabled()
 		return
-	elif response_code == 429:
-		var reason := _extract_error(body, "rate_limited")
+	elif code == 403 and _is_fatal_playtest_error(error):
+		_on_playtest_refused(error)
+		return
+	elif code == 403:
+		flush_failed.emit("invalid_key")
+		_refuse_key()
+	elif code == 429 or (code == 503 and _extract_retry_after(headers) >= 0.0):
+		var reason := error if not error.is_empty() else "rate_limited"
 		push_warning("Ravensight: track/batch rate-limited (%s)" % reason)
+		_transient_reason = "rate_limited"
+		_update_reason()
 		flush_failed.emit(reason)
 		_schedule_retry(_extract_retry_after(headers))
-	elif response_code == 400:
+	elif code == 400:
 		# The server refuses the whole batch when any event in it violates a
-		# ceiling. Halve until the poison event is isolated, then drop it -
+		# ceiling. Halve until the poison event is isolated, then drop it:
 		# one bloated event must never cost the rest of its batch, and
 		# retrying the identical payload forever would deliver nothing.
-		var reason400 := _extract_error(body, "http_400")
+		var reason400 := error if not error.is_empty() else "http_400"
 		if batch_size <= 1:
-			pending_events = pending_events.slice(batch_size, pending_events.size())
-			push_warning("Ravensight: dropped one rejected event (%s)" % reason400)
+			_drop_front(batch_size)
+			_log_once("dropped_400", "Ravensight: dropped one event the server refused (%s)" % reason400, false)
 			flush_failed.emit(reason400)
-			if not pending_events.is_empty():
-				call_deferred("_flush_pending")
 		else:
 			_split_batch_size = maxi(1, batch_size / 2)
 			push_warning("Ravensight: batch rejected (%s), splitting to %d" % [reason400, _split_batch_size])
-			call_deferred("_flush_pending")
+		_flush_pending(_quitting)
 	else:
-		var reason2 := _extract_error(body, "http_%d" % response_code)
-		push_warning("Ravensight: batch flush failed (HTTP %d), will retry" % response_code)
+		var reason2 := error if not error.is_empty() else ("offline" if code == 0 else "http_%d" % code)
+		push_warning("Ravensight: batch flush failed (%s), will retry" % reason2)
+		if code == 0:
+			_transient_reason = "offline"
+			_update_reason()
 		flush_failed.emit(reason2)
 		_schedule_retry()
 
 	# Quitting: this answer is what the quit was waiting for. Keep going only
 	# while the queue is still draining (more batches, a split, or a session
-	# refresh); a failure is not retried. The quit timer bounds the wait.
+	# refresh); a failure is not retried. The quit deadline bounds the wait.
 	if _quitting:
-		var still_sending := not pending_events.is_empty() and response_code in [202, 400, 401]
+		var still_sending := _flush_in_progress or _session_request_pending
 		if not still_sending:
 			_finish_quit()
 
 ## --- Public API: feedback (POST /api/v1/feedback) --------------------------------
 
-## Submit free-form player feedback. `category` and `rating` are optional;
-## pass rating in 1-5 if you have one, or leave it 0 to omit it.
+## Submit free-form player feedback. `category` is optional and one of
+## FEEDBACK_CATEGORIES; `rating` is optional, 0 to omit it or a whole number
+## from 1 to 5. Anything else fails at once on feedback_failed
+## ("invalid_category" or "invalid_rating") and nothing is sent.
 func submit_feedback(message: String, category: String = "", rating: int = 0) -> void:
-	if not tracking_enabled:
-		push_warning("Ravensight: tracking disabled, feedback not sent")
-		feedback_failed.emit("tracking_disabled")
+	if not _is_active():
+		feedback_failed.emit("disabled")
 		return
 	if message.is_empty():
 		push_warning("Ravensight: feedback message is empty")
 		feedback_failed.emit("empty_message")
 		return
+	if not category.is_empty() and not FEEDBACK_CATEGORIES.has(category):
+		push_warning("Ravensight: feedback category '%s' is not one of bug, suggestion, complaint, praise, playtest, other" % category)
+		feedback_failed.emit("invalid_category")
+		return
+	if rating != 0 and (rating < 1 or rating > 5):
+		push_warning("Ravensight: feedback rating must be 1 to 5, or 0 to omit it")
+		feedback_failed.emit("invalid_rating")
+		return
 	if not _is_session_valid():
 		push_warning("Ravensight: no valid session yet, cannot submit feedback")
 		feedback_failed.emit("no_session")
-		if not _session_request_pending:
-			_start_session()
+		_start_session()
 		return
 
 	var payload := {"message": message}
 	if not category.is_empty():
 		payload["category"] = category
-	if rating > 0:
+	if rating != 0:
 		payload["rating"] = rating
+	_send("POST", "/feedback", _session_headers(), JSON.stringify(payload), _on_feedback_response)
 
-	var http := HTTPRequest.new()
-	add_child(http)
-	http.request_completed.connect(_on_feedback_response.bind(http))
-
-	var headers := ["Content-Type: application/json", "X-Session-Token: " + session_token]
-	var err := http.request(api_url + "/api/v1/feedback", headers, HTTPClient.METHOD_POST, JSON.stringify(payload))
-	if err != OK:
-		http.queue_free()
-		push_error("Ravensight: failed to submit feedback (error %d)" % err)
-		feedback_failed.emit("request_error")
-
-func _on_feedback_response(_result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray, http: HTTPRequest) -> void:
-	http.queue_free()
-	if response_code == 201:
+func _on_feedback_response(code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	var error := _extract_error(body, "")
+	if code == 201:
 		feedback_submitted.emit()
-	else:
-		push_warning("Ravensight: feedback submission failed (HTTP %d)" % response_code)
-		feedback_failed.emit(_extract_error(body, "http_%d" % response_code))
+		return
+	push_warning("Ravensight: feedback submission failed (HTTP %d)" % code)
+	feedback_failed.emit(error if not error.is_empty() else ("offline" if code == 0 else "http_%d" % code))
+	if code == 403 and error == "tracking_disabled":
+		_on_server_tracking_disabled()
+	elif code == 403 and _is_fatal_playtest_error(error):
+		_on_playtest_refused(error)
+	elif code == 401:
+		# The session expired; the next send opens a new one.
+		session_token = ""
+		session_expires_at = 0
 
 ## --- EXPERIMENTAL: agent suggestions (GET /api/v1/agent/suggestions) -------------
 ##
 ## This hits an AI-generated suggestions endpoint that is still evolving on
 ## the server side (empty array until your game has accumulated enough data
 ## for weekly digests). Shape may change; treat this as experimental and
-## don't build critical game logic around it.
+## don't build critical game logic around it. While tracking is off nothing
+## is requested and suggestions_received fires with an empty list.
 
 func fetch_suggestions() -> void:
-	var http := HTTPRequest.new()
-	add_child(http)
-	http.request_completed.connect(_on_suggestions_response.bind(http))
+	if not _is_ready or not _is_active():
+		# Deferred, so a caller that awaits the signal after calling still
+		# receives it.
+		call_deferred("_emit_no_suggestions")
+		return
+	_send("GET", "/agent/suggestions", _key_headers(), "", _on_suggestions_response)
 
-	var headers := ["X-API-Key: " + ingest_key]
-	var err := http.request(api_url + "/api/v1/agent/suggestions", headers, HTTPClient.METHOD_GET)
-	if err != OK:
-		http.queue_free()
-		push_error("Ravensight: failed to fetch suggestions (error %d)" % err)
-		suggestions_received.emit([])
+func _emit_no_suggestions() -> void:
+	suggestions_received.emit([])
 
-func _on_suggestions_response(_result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray, http: HTTPRequest) -> void:
-	http.queue_free()
-	if response_code == 200:
+func _on_suggestions_response(code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	if code == 200:
 		var parsed = _parse_json(body)
 		if parsed is Dictionary and parsed.has("suggestions") and parsed["suggestions"] is Array:
 			suggestions_received.emit(parsed["suggestions"])
 		else:
 			suggestions_received.emit([])
-	else:
-		push_warning("Ravensight: fetch_suggestions failed (HTTP %d)" % response_code)
-		suggestions_received.emit([])
+		return
+	push_warning("Ravensight: fetch_suggestions failed (HTTP %d)" % code)
+	suggestions_received.emit([])
+	var error := _extract_error(body, "")
+	if code == 403 and error == "tracking_disabled":
+		_on_server_tracking_disabled()
+	elif code == 403 and _is_fatal_playtest_error(error):
+		_on_playtest_refused(error)
+	elif code == 401 or code == 403:
+		_refuse_key()
 
 ## --- Helpers ------------------------------------------------------------------
 
@@ -892,12 +1299,6 @@ func _extract_error(body: PackedByteArray, fallback: String) -> String:
 		return str(parsed["error"])
 	return fallback
 
-## True for the two playtest auth failures that will never clear up on their
-## own: a bad/expired token, or a job the CLI has already closed out.
-func _is_fatal_playtest_reason(body: PackedByteArray) -> bool:
-	var reason := _extract_error(body, "")
-	return reason == "invalid_playtest_token" or reason == "playtest_job_closed"
-
 ## Parses a Retry-After header (delta-seconds form) if present. Returns -1.0
 ## when absent so callers fall back to their own exponential backoff.
 func _extract_retry_after(headers: PackedStringArray) -> float:
@@ -909,3 +1310,14 @@ func _extract_retry_after(headers: PackedStringArray) -> float:
 				if val.is_valid_int():
 					return float(int(val))
 	return -1.0
+
+## Logs a message the first time `key` is seen this run, at warning level
+## when `warning` is true, otherwise as a plain print.
+func _log_once(key: String, message: String, warning: bool) -> void:
+	if _logged_once.has(key):
+		return
+	_logged_once[key] = true
+	if warning:
+		push_warning(message)
+	else:
+		print(message)
