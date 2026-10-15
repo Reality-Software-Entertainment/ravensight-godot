@@ -8,6 +8,9 @@ const TEST_STORAGE_DIR := "user://ravensight_tests/"
 var fake_now: float = 1000.0
 var fake_unix: int = 1800000000
 var mobile: bool = false
+var web: bool = false
+var memory: float = 128.0
+var ticks: int = 2500
 ## Every request: {method, path, headers, body, callback, answered}.
 var requests: Array = []
 var quit_codes: Array = []
@@ -23,6 +26,15 @@ func _storage_dir() -> String:
 
 func _is_mobile() -> bool:
 	return mobile
+
+func _is_web() -> bool:
+	return web
+
+func _memory_mb() -> float:
+	return memory
+
+func _ticks_msec() -> int:
+	return ticks
 
 func _quit_tree(exit_code: int) -> void:
 	quit_codes.append(exit_code)

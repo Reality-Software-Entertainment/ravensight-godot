@@ -58,6 +58,21 @@ func _run() -> void:
 		"test_cold_launch_marker",
 		"test_cold_launch_marker_expired_or_opted_out",
 		"test_desktop_focus_out_sends_nothing_new",
+		"test_session_request_carries_sdk",
+		"test_track_purchase_properties",
+		"test_track_resource_properties",
+		"test_track_progression_properties",
+		"test_track_error_properties",
+		"test_typed_extra_data_reserved_keys_win",
+		"test_typed_helpers_respect_optout",
+		"test_health_off_by_default",
+		"test_health_summary_percentiles",
+		"test_health_reservoir_is_bounded",
+		"test_health_sampled_once_per_second",
+		"test_health_one_send_on_quit",
+		"test_health_mobile_background_once_per_session",
+		"test_health_web_page_hide",
+		"test_health_no_samples_sends_nothing",
 	]
 	for name in tests:
 		_current = name
@@ -172,7 +187,7 @@ func test_api_base_forms() -> void:
 	eq(fresh.api_url, "https://api.ravensight.io", "default api_url is the bare host")
 	eq(Fake.REQUEST_TIMEOUT_SECONDS, 15.0, "request timeout")
 	eq(fresh.max_queue_size, 500, "default queue cap")
-	eq(Fake.VERSION, "0.2.0", "version constant")
+	eq(Fake.VERSION, "0.3.0", "version constant")
 	sdk.free()
 	fresh.free()
 
@@ -748,3 +763,211 @@ func test_later_enable_stamps_game_started_now() -> void:
 	quitter.quit()
 	eq(quitter.quit_codes, [0], "quit() before the node is in the tree does not crash")
 	quitter.free()
+
+# --- typed events and health --------------------------------------------------
+
+## The data of the last event queued.
+func last_data(sdk: Fake) -> Dictionary:
+	return sdk.pending_events[sdk.pending_events.size() - 1]["data"]
+
+func last_name(sdk: Fake) -> String:
+	return sdk.pending_events[sdk.pending_events.size() - 1]["event"]
+
+func test_session_request_carries_sdk() -> void:
+	var sdk := start()
+	sdk.answer(200, {"trackingEnabled": true})
+	var body = JSON.parse_string(sdk.requests[1]["body"])
+	eq(body["sdk"], "godot/0.3.0", "sdk name and version on session create")
+
+func test_track_purchase_properties() -> void:
+	var sdk := start()
+	sdk.track_purchase("iap", "gem_pack", 499, "usd")
+	eq(last_name(sdk), "purchase", "default event name")
+	eq(last_data(sdk), {
+		"rs_kind": "purchase", "rs_amount": 499, "rs_currency": "USD",
+		"rs_item_type": "iap", "rs_item_id": "gem_pack",
+	}, "exact property set, currency upper-cased, no optional keys")
+	sdk.track_purchase("iap", "gem_pack", "1299", "eur", {"cart": "c1", "transaction_id": "t9", "event_name": "bought"})
+	eq(last_name(sdk), "bought", "event name override")
+	eq(last_data(sdk), {
+		"rs_kind": "purchase", "rs_amount": "1299", "rs_currency": "EUR",
+		"rs_item_type": "iap", "rs_item_id": "gem_pack", "rs_cart": "c1", "rs_transaction_id": "t9",
+	}, "digit string amount, cart and transaction id")
+	sdk.track_purchase("iap", "x", 4.99, "us")
+	eq(last_data(sdk)["rs_amount"], 4.99, "bad input passes through, no throw")
+	eq(last_data(sdk)["rs_currency"], "US", "bad currency passes through upper-cased")
+
+func test_track_resource_properties() -> void:
+	var sdk := start()
+	sdk.track_resource("source", "gold", 25)
+	eq(last_name(sdk), "resource_source", "default name by flow")
+	eq(last_data(sdk), {"rs_kind": "resource", "rs_flow": "source", "rs_resource": "gold", "rs_amount": 25}, "source property set")
+	sdk.track_resource("sink", "gold", 10.5, {"item_type": "weapon", "item_id": "sword"})
+	eq(last_name(sdk), "resource_sink", "sink name")
+	eq(last_data(sdk), {
+		"rs_kind": "resource", "rs_flow": "sink", "rs_resource": "gold", "rs_amount": 10.5,
+		"rs_item_type": "weapon", "rs_item_id": "sword",
+	}, "sink with item")
+	sdk.track_resource("sink", "gold", 1, {"event_name": "spent"})
+	eq(last_name(sdk), "spent", "override")
+
+func test_track_progression_properties() -> void:
+	var sdk := start()
+	sdk.track_progression("start", "world1")
+	eq(last_name(sdk), "progression_start", "start name")
+	eq(last_data(sdk), {"rs_kind": "progression", "rs_status": "start", "rs_p1": "world1"}, "minimal")
+	sdk.track_progression("complete", "world1", {"p2": "level3", "p3": "boss", "score": 1200})
+	eq(last_name(sdk), "progression_complete", "complete name")
+	eq(last_data(sdk), {
+		"rs_kind": "progression", "rs_status": "complete", "rs_p1": "world1",
+		"rs_p2": "level3", "rs_p3": "boss", "rs_score": 1200,
+	}, "all nodes and score")
+	sdk.track_progression("fail", "w", {"event_name": "oops"})
+	eq(last_name(sdk), "oops", "override")
+	sdk.track_progression("fail", "w")
+	eq(last_name(sdk), "progression_fail", "fail name")
+
+func test_track_error_properties() -> void:
+	var sdk := start()
+	sdk.track_error("warning", "low memory")
+	eq(last_name(sdk), "error", "default name")
+	eq(last_data(sdk), {"rs_kind": "error", "rs_severity": "warning", "rs_message": "low memory"}, "no stack key when none given")
+	sdk.track_error("critical", "m".repeat(500), {"stack": "s".repeat(3000)})
+	eq(last_data(sdk)["rs_message"].length(), 200, "message cut to 200")
+	eq(last_data(sdk)["rs_stack"].length(), 2000, "stack cut to 2000")
+	sdk.track_error("info", "x".repeat(200), {"stack": "y".repeat(2000), "event_name": "problem"})
+	eq(last_data(sdk)["rs_message"].length(), 200, "200 is kept whole")
+	eq(last_data(sdk)["rs_stack"].length(), 2000, "2000 is kept whole")
+	eq(last_name(sdk), "problem", "override")
+
+func test_typed_extra_data_reserved_keys_win() -> void:
+	var sdk := start()
+	var extra := {"level": "castle", "rs_kind": "none", "rs_amount": 1, "rs_currency": "xxx"}
+	sdk.track_purchase("iap", "a", 100, "usd", {"data": extra})
+	var d := last_data(sdk)
+	eq(d["level"], "castle", "caller key kept")
+	eq(d["rs_kind"], "purchase", "reserved kind wins")
+	eq(d["rs_amount"], 100, "reserved amount wins")
+	eq(d["rs_currency"], "USD", "reserved currency wins")
+	eq(extra["rs_kind"], "none", "caller's dictionary is not modified")
+	sdk.track_error("error", "boom", {"data": {"rs_message": "other", "rs_stack": "kept"}})
+	eq(last_data(sdk)["rs_message"], "boom", "reserved message wins")
+	eq(last_data(sdk)["rs_stack"], "kept", "unreserved-by-helper caller key survives when helper sets none")
+
+func test_typed_helpers_respect_optout() -> void:
+	var sdk := start({"enabled": false})
+	sdk.track_purchase("iap", "a", 1, "usd")
+	sdk.track_resource("source", "gold", 1)
+	sdk.track_progression("start", "w")
+	sdk.track_error("error", "e")
+	sdk.flush()
+	eq(sdk.requests.size(), 0, "no network while off")
+	eq(sdk.pending_events.size(), 0, "nothing queued while off")
+
+func test_health_off_by_default() -> void:
+	var sdk := started_with_session()
+	for i in 5:
+		sdk._sample_frame(1.0)
+	sdk.quit()
+	eq(sent_count(sdk, "health") + queued_names(sdk).count("health"), 0, "no health without the performance flag")
+
+func test_health_summary_percentiles() -> void:
+	var sdk := start({"performance": true})
+	for i in range(1, 101):
+		sdk._add_fps_sample(float(i))
+	var s := sdk._health_summary()
+	eq(s["rs_kind"], "health", "kind")
+	eq(s["rs_fps_median"], 50.5, "median of 1..100")
+	eq(s["rs_fps_p10"], 10.0, "10th percentile of 1..100")
+	eq(s["rs_memory_mb"] if s.has("rs_memory_mb") else -1.0, -1.0, "no memory until a reading was taken")
+	eq(s["rs_boot_ms"], 2500, "boot time from the engine tick count at ready")
+	var odd := start({"performance": true})
+	for v in [30.0, 10.0, 60.0, 20.0, 50.0]:
+		odd._add_fps_sample(v)
+	var o := odd._health_summary()
+	eq(o["rs_fps_median"], 30.0, "median of an odd set")
+	eq(o["rs_fps_p10"], 10.0, "p10 of five is the lowest")
+
+func test_health_reservoir_is_bounded() -> void:
+	var sdk := start({"performance": true})
+	for i in 1000:
+		sdk._add_fps_sample(float(i))
+	eq(sdk._fps_samples.size(), 600, "at most 600 samples")
+	var s := sdk._health_summary()
+	eq(s["rs_fps_p10"], 459.0, "oldest were replaced: 400..999 remain")
+
+func test_health_sampled_once_per_second() -> void:
+	var sdk := started_with_session({"performance": true})
+	var base := sdk.requests.size()
+	for i in 4:
+		sdk._sample_frame(0.25)
+	eq(sdk._fps_samples.size(), 1, "four 0.25 second frames make one reading")
+	eq(sdk.pending_events.size(), 0, "sampling queues nothing")
+	eq(sdk.requests.size(), base, "and sends nothing")
+	sdk._sample_frame(1.0)
+	eq(sdk._fps_samples.size(), 2, "a one second frame is a reading")
+	eq(sdk._last_memory_mb, 128.0, "memory is read with the sample")
+	sdk._sample_frame(0.0)
+	eq(sdk._fps_samples.size(), 2, "a zero delta is ignored")
+
+func test_health_one_send_on_quit() -> void:
+	var sdk := started_with_session({"performance": true})
+	sdk._sample_frame(1.0)
+	sdk._sample_frame(0.5)
+	sdk._sample_frame(0.5)
+	sdk.quit()
+	var names := sdk.event_names(sdk.unanswered()[0])
+	eq(names, ["health", "game_exited"], "health goes out with the final flush, before game_exited")
+	var h: Dictionary = sdk.events_in(sdk.unanswered()[0])[0]["data"]
+	eq(h["rs_kind"], "health", "kind")
+	eq(h["rs_fps_median"], 1.5, "median fps of 1 and 2")
+	eq(h["rs_fps_p10"], 1.0, "p10 fps")
+	eq(h["rs_memory_mb"], 128.0, "memory")
+	eq(int(h["rs_boot_ms"]), 2500, "boot")
+	sdk._send_health_once()
+	eq(sent_count(sdk, "health"), 1, "never a second health event in the session")
+
+func test_health_mobile_background_once_per_session() -> void:
+	var sdk := started_with_session({"performance": true, "mobile": true, "session_timeout": 60.0})
+	sdk._sample_frame(1.0)
+	sdk.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	eq(sent_count(sdk, "health"), 1, "health on background entry")
+	sdk.answer_all_ok()
+	sdk.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
+	sdk.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	sdk.answer_all_ok()
+	eq(sent_count(sdk, "health"), 1, "a second background in the same session sends none")
+	sdk.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
+	sdk.advance(100.0)
+	sdk.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	sdk.advance(100.0)
+	sdk.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
+	sdk.answer_all_ok()
+	sdk._sample_frame(1.0)
+	sdk.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	sdk.answer_all_ok()
+	eq(sent_count(sdk, "health"), 2, "a new session after the timeout sends its own")
+
+func test_health_web_page_hide() -> void:
+	var sdk := started_with_session({"performance": true, "web": true})
+	sdk._sample_frame(1.0)
+	sdk.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	eq(sdk.event_names(sdk.unanswered()[0]), ["health"], "page hide sends health")
+	sdk.answer_all_ok()
+	sdk.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	sdk.answer_all_ok()
+	eq(sent_count(sdk, "health"), 1, "only once")
+	var desk := started_with_session({"performance": true})
+	desk._sample_frame(1.0)
+	desk.notification(Node.NOTIFICATION_APPLICATION_FOCUS_OUT)
+	desk.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	eq(desk.pending_events.size(), 0, "desktop focus loss sends no health")
+	eq(desk.unanswered().size(), 0, "and nothing else")
+
+func test_health_no_samples_sends_nothing() -> void:
+	var sdk := started_with_session({"performance": true, "mobile": true})
+	sdk.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	sdk.quit()
+	eq(sent_count(sdk, "health") + queued_names(sdk).count("health"), 0, "no samples, no health event")
+	var names := sdk.event_names(sdk.unanswered()[0]) if sdk.unanswered().size() > 0 else []
+	check(not names.has("health"), "not in the final flush either")

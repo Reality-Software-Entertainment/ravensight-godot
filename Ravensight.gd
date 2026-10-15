@@ -12,7 +12,7 @@
 extends Node
 
 ## The SDK version. Bumped with every tagged release.
-const VERSION := "0.2.0"
+const VERSION := "0.3.0"
 
 ## --- Signals -------------------------------------------------------------
 
@@ -88,6 +88,13 @@ signal event_tracked(event_name: String, data: Dictionary)
 ## background, then a new session with game_started on return).
 @export var session_timeout: float = 1800.0
 
+## Opt-in per-session performance sampling. When true the SDK samples the
+## frame time once per second, and sends one `health` event per session
+## (frames per second median and 10th percentile, memory where the platform
+## exposes it, boot time) when the app goes to the background (mobile), the
+## page is hidden (web) or the game quits (desktop). Off by default.
+@export var performance: bool = false
+
 ## --- Constants --------------------------------------------------------------
 
 const MAX_BATCH_SIZE: int = 50          # server hard limit on /track/batch
@@ -101,6 +108,11 @@ const MAX_REAUTH_ATTEMPTS: int = 2
 ## before it is sent.
 const FEEDBACK_CATEGORIES: Array[String] = ["bug", "suggestion", "complaint", "praise", "playtest", "other"]
 ## Where this install's random device id lives (see _load_or_create_device_id).
+const HEALTH_RESERVOIR_SIZE: int = 600
+const HEALTH_SAMPLE_SECONDS: float = 1.0
+const MAX_ERROR_MESSAGE_CHARS: int = 200
+const MAX_ERROR_STACK_CHARS: int = 2000
+
 const DEVICE_ID_PATH: String = "user://device_id.save"
 ## Present only while the player has opted out (see set_tracking_enabled).
 const OPTOUT_PATH: String = "user://ravensight_optout.save"
@@ -216,6 +228,16 @@ var _quit_called: bool = false
 var _quit_deadline: float = -1.0
 var _quit_exit_code: int = 0
 
+## Health sampling state: a ring of at most HEALTH_RESERVOIR_SIZE frames
+## per second readings, the seconds since the last reading, and whether this
+## session already sent its one health event.
+var _fps_samples: Array = []
+var _fps_next: int = 0
+var _sample_clock: float = 0.0
+var _health_sent: bool = false
+var _boot_ms: int = -1
+var _last_memory_mb: float = -1.0
+
 ## --- Playtest mode ------------------------------------------------------------
 ##
 ## Set from RAVENSIGHT_PLAYTEST_TOKEN and RAVENSIGHT_PLAYTEST_RUN_ID (or the
@@ -254,6 +276,7 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_take_over_quit()
 	_is_ready = true
+	_boot_ms = _ticks_msec()
 
 	_send_exit_marker_if_any()
 
@@ -277,8 +300,9 @@ func _ready() -> void:
 		return
 	_activate(true)
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	_tick()
+	_sample_frame(delta)
 
 ## Runs the timers: the retry wait, the batching window and the quit
 ## deadline. Called every frame.
@@ -340,6 +364,8 @@ func _notification(what: int) -> void:
 			if _is_mobile():
 				_on_backgrounded()
 			else:
+				if _is_web():
+					_send_health_once()
 				_flush_pending(true)
 		NOTIFICATION_APPLICATION_RESUMED:
 			if _is_mobile():
@@ -369,6 +395,7 @@ func _flush_then_quit(exit_code: int) -> void:
 		return
 	_quitting = true
 	_quit_exit_code = exit_code
+	_send_health_once()
 	_queue_game_exited()
 	if not _is_ready or not _is_active() or pending_events.is_empty():
 		_finish_quit()
@@ -397,6 +424,19 @@ func _quit_tree(exit_code: int) -> void:
 func _is_mobile() -> bool:
 	return OS.has_feature("android") or OS.has_feature("ios")
 
+func _is_web() -> bool:
+	return OS.has_feature("web")
+
+func _ticks_msec() -> int:
+	return Time.get_ticks_msec()
+
+## Megabytes of memory in use, or -1.0 where the platform does not say.
+func _memory_mb() -> float:
+	var bytes := OS.get_static_memory_usage()
+	if bytes <= 0:
+		return -1.0
+	return float(bytes) / 1048576.0
+
 ## The app went to the background. Mobile may kill it there without another
 ## notification, so the queue is sent now and a small marker is saved: if
 ## the app never comes back, the next launch reports game_exited for this
@@ -405,6 +445,7 @@ func _on_backgrounded() -> void:
 	if not _is_ready or not _is_active():
 		return
 	_backgrounded_at = _unix_now()
+	_send_health_once()
 	_flush_pending(true)
 	if playtest_token.is_empty() and not session_token.is_empty():
 		_write_text(BACKGROUND_MARKER_PATH, JSON.stringify({
@@ -432,6 +473,9 @@ func _on_foregrounded() -> void:
 	# Everything queued so far belongs to the old session; once it is
 	# delivered the session is dropped and a new one opens.
 	_session_boundary = pending_events.size()
+	_health_sent = false
+	_fps_samples.clear()
+	_fps_next = 0
 	_started_queued = false
 	_exit_queued = false
 	_queue_game_started(false)
@@ -740,6 +784,7 @@ func _start_session(explicit: bool = false) -> void:
 		"deviceId": device_id,
 		"gameVersion": game_version,
 		"platform": platform,
+		"sdk": "godot/" + VERSION,
 	})
 	_send("POST", "/session", headers, body, _on_session_response.bind(generation))
 
@@ -845,6 +890,129 @@ func track_event(event_name: String, data: Dictionary = {}) -> void:
 		return
 	if pending_events.size() >= MAX_BATCH_SIZE:
 		_flush_pending()
+
+## --- Typed events ---------------------------------------------------------------
+##
+## Thin helpers over track_event(): each builds the reserved rs_* properties
+## and queues an ordinary event, so batching, retries and opt-out are the
+## same. `options` may carry `data` (extra properties, merged first so the
+## reserved keys win) and `event_name` (replaces the default name). Nothing
+## here validates or throws: the server flags a malformed event instead.
+
+## A real-money purchase. `amount` is whole minor units of `currency` (499 is
+## 4.99 USD), an integer or a digit string. `options`: cart, transaction_id,
+## data, event_name.
+func track_purchase(item_type: Variant, item_id: Variant, amount: Variant, currency: Variant, options: Dictionary = {}) -> void:
+	var props := _typed_base(options)
+	props["rs_kind"] = "purchase"
+	props["rs_amount"] = amount
+	props["rs_currency"] = str(currency).to_upper()
+	props["rs_item_type"] = item_type
+	props["rs_item_id"] = item_id
+	_typed_optional(props, options, "rs_cart", "cart")
+	_typed_optional(props, options, "rs_transaction_id", "transaction_id")
+	track_event(str(options.get("event_name", "purchase")), props)
+
+## An in-game resource gained (`source`) or spent (`sink`). `amount` is a
+## number. `options`: item_type, item_id, data, event_name.
+func track_resource(flow: Variant, resource: Variant, amount: Variant, options: Dictionary = {}) -> void:
+	var props := _typed_base(options)
+	props["rs_kind"] = "resource"
+	props["rs_flow"] = flow
+	props["rs_resource"] = resource
+	props["rs_amount"] = amount
+	_typed_optional(props, options, "rs_item_type", "item_type")
+	_typed_optional(props, options, "rs_item_id", "item_id")
+	track_event(str(options.get("event_name", "resource_" + str(flow))), props)
+
+## A progression step: `status` is `start`, `complete` or `fail`, `p1` the
+## node. `options`: p2, p3, score, data, event_name.
+func track_progression(status: Variant, p1: Variant, options: Dictionary = {}) -> void:
+	var props := _typed_base(options)
+	props["rs_kind"] = "progression"
+	props["rs_status"] = status
+	props["rs_p1"] = p1
+	_typed_optional(props, options, "rs_p2", "p2")
+	_typed_optional(props, options, "rs_p3", "p3")
+	_typed_optional(props, options, "rs_score", "score")
+	track_event(str(options.get("event_name", "progression_" + str(status))), props)
+
+## An error. `severity` is `debug`, `info`, `warning`, `error` or `critical`.
+## The message is cut to 200 characters and the stack to 2000. `options`:
+## stack, data, event_name.
+func track_error(severity: Variant, message: Variant, options: Dictionary = {}) -> void:
+	var props := _typed_base(options)
+	props["rs_kind"] = "error"
+	props["rs_severity"] = severity
+	props["rs_message"] = str(message).substr(0, MAX_ERROR_MESSAGE_CHARS)
+	if options.get("stack") != null:
+		props["rs_stack"] = str(options["stack"]).substr(0, MAX_ERROR_STACK_CHARS)
+	track_event(str(options.get("event_name", "error")), props)
+
+## The caller's extra properties, copied, ready for the reserved keys.
+func _typed_base(options: Dictionary) -> Dictionary:
+	var extra = options.get("data", {})
+	return (extra as Dictionary).duplicate() if extra is Dictionary else {}
+
+func _typed_optional(props: Dictionary, options: Dictionary, key: String, option: String) -> void:
+	if options.get(option) != null:
+		props[key] = options[option]
+
+## --- Health sampling ---------------------------------------------------------------
+
+## Called every frame. Takes one reading per HEALTH_SAMPLE_SECONDS, never
+## sends anything.
+func _sample_frame(delta: float) -> void:
+	if not performance or delta <= 0.0:
+		return
+	_sample_clock += delta
+	if _sample_clock < HEALTH_SAMPLE_SECONDS:
+		return
+	_sample_clock = 0.0
+	_add_fps_sample(1.0 / delta)
+	var mb := _memory_mb()
+	if mb >= 0.0:
+		_last_memory_mb = mb
+
+## Keeps at most HEALTH_RESERVOIR_SIZE readings; the oldest is replaced.
+func _add_fps_sample(fps: float) -> void:
+	if _fps_samples.size() < HEALTH_RESERVOIR_SIZE:
+		_fps_samples.append(fps)
+	else:
+		_fps_samples[_fps_next] = fps
+		_fps_next = (_fps_next + 1) % HEALTH_RESERVOIR_SIZE
+
+## The health properties for the samples taken, or {} when there are none.
+func _health_summary() -> Dictionary:
+	if _fps_samples.is_empty():
+		return {}
+	var sorted := _fps_samples.duplicate()
+	sorted.sort()
+	var n := sorted.size()
+	var median: float = sorted[n / 2] if n % 2 == 1 else (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+	var p10: float = sorted[maxi(ceili(0.1 * n) - 1, 0)]
+	var props := {
+		"rs_kind": "health",
+		"rs_fps_median": snappedf(median, 0.01),
+		"rs_fps_p10": snappedf(p10, 0.01),
+	}
+	if _last_memory_mb >= 0.0:
+		props["rs_memory_mb"] = snappedf(_last_memory_mb, 0.1)
+	if _boot_ms >= 0:
+		props["rs_boot_ms"] = _boot_ms
+	return props
+
+## Queues the session's one health event, if sampling is on and any sample
+## was taken. Goes through track_event(), so opt-out and the kill switch
+## apply. Never called from the frame hook.
+func _send_health_once() -> void:
+	if not performance or _health_sent or not _is_active():
+		return
+	var props := _health_summary()
+	if props.is_empty():
+		return
+	_health_sent = true
+	track_event("health", props)
 
 ## Send what is queued now instead of waiting for the timer. Cuts a backoff
 ## wait short and, after the ingest key was refused, makes one more
