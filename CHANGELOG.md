@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.3.0] - 2026-10-16
+
+For games whose builds or source anyone can download. A game that sets a
+key and none of the new options behaves as on 0.2.0, except for the
+changes listed under Breaking. `Ravensight.VERSION` is `"0.3.0"`.
+
+### Breaking
+
+- `ingest_key` defaults to `""` (was the placeholder
+  `gt_live_your_ingest_key_here`). With no key the SDK is inert instead of
+  sending requests with a placeholder key.
+- A refused ingest key (401, or a 403 that is not the kill switch or a
+  refused playtest token) on the settings check, the session, a batch,
+  feedback or suggestions now ends the run: the queue is cleared, nothing
+  is retried, `flush()` sends nothing, and `tracking_disabled("key")` is
+  emitted. Before, events kept queueing and `flush()` tried once more. A
+  401 on a batch still means an expired session: the SDK opens a new one
+  first.
+- Backoff waits carry plus or minus 20 percent jitter. `Retry-After` is
+  still obeyed exactly.
+- Every event's data gains an `rs_event_id` key, and the SDK always queues
+  a copy of the caller's dictionary (it queued the caller's own dictionary
+  outside a playtest run).
+- An event whose data is over 8,192 bytes as JSON is dropped before it is
+  queued, with one warning for the run and `flush_failed("event_too_large")`
+  for each, instead of being sent and split out by the server's 400.
+- No device id file is written before `_ready()`: it is made there, once
+  the SDK knows it has a key (and, with `consent = "opt_in"`, a yes).
+
+### Added
+
+- **Inert without a key.** An empty `ingest_key`, and no
+  `ravensight/ingest_key` project setting, writes no files, makes no
+  request, runs no timer and leaves the window close alone; every call is
+  a quiet no-op. One warning, silenced by `optional = true`.
+  `get_status_reason()` is `"no_key"`.
+- `ravensight/ingest_key` project setting, read when `ingest_key` is empty,
+  so a release step can add the key on the build machine only.
+- `consent = "opt_in"`: no device id, settings check or session before
+  `set_tracking_enabled(true)`; the yes is saved as
+  `user://ravensight_optin.save`. `"opt_out"` stays the default. Events
+  tracked before the yes are dropped; events right after it are queued
+  while the settings check runs. Saying no again keeps the device id;
+  `reset_device_id()` forgets it.
+- `distribution` option, sent on `POST /session` when set (at most 40
+  characters, no control characters, otherwise not sent and one warning).
+- `rs_event_id` on every event: the first 16 characters of the device id,
+  the launch time in hex, an 8 hex character per-launch nonce from
+  `Crypto` and a counter. A resend after a failure carries the same id.
+- `is_enabled()`, true only while the SDK is collecting.
+
 ## [0.2.0] - 2026-10-10
 
 The first versioned release. `Ravensight.VERSION` is `"0.2.0"`.

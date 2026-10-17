@@ -20,7 +20,8 @@ analytics for indie games. One autoload script gives your game:
 - **Suggestions API** (experimental): machine-readable tuning hints derived
   from Ravensight's weekly AI analysis
 
-Version 0.2.0. See [CHANGELOG.md](CHANGELOG.md) for what changed.
+Version 0.3.0. See [CHANGELOG.md](CHANGELOG.md) for what changed. Shipping
+a build anyone can download? Read "Public builds" below.
 
 ## Install
 
@@ -28,8 +29,10 @@ Version 0.2.0. See [CHANGELOG.md](CHANGELOG.md) for what changed.
 2. Project > Project Settings > Autoload: add it, named `Ravensight`.
 3. Set your game's `ingest_key` (`gt_live_...`, from the Ravensight
    dashboard) before Ravensight's `_ready()` runs: edit the default at the
-   top of `Ravensight.gd`, or set it from an autoload listed above
-   `Ravensight`. The same goes for every option below.
+   top of `Ravensight.gd`, set it from an autoload listed above
+   `Ravensight`, or set the project setting `ravensight/ingest_key`. The
+   same goes for every option below. With no key the SDK is inert (see
+   "Public builds").
 
 The ingest key is publishable and safe to ship in your binary: it can open
 sessions, read the tracking kill switch and read this game's design
@@ -54,7 +57,10 @@ It is safe to call from any autoload, even before Ravensight's own
 | Option | Default | Notes |
 | --- | --- | --- |
 | `api_url` | `https://api.ravensight.io` | With or without `/api/v1`, with or without a trailing slash. Empty means the default. `api_base()` returns the normalised root. |
-| `ingest_key` | `gt_live_your_ingest_key_here` | Your game's publishable `gt_live_` key. |
+| `ingest_key` | `""` | Your game's publishable `gt_live_` key, or a public `gt_pub_` key. Empty falls back to the project setting `ravensight/ingest_key`; empty there too, the SDK is inert for the run. |
+| `optional` | `false` | `true` silences the one warning an inert start (no key) prints. |
+| `consent` | `"opt_out"` | `"opt_in"` sends nothing, and makes no device id, until `set_tracking_enabled(true)`. See Public builds. |
+| `distribution` | `""` | A short label for this build, such as `"steam-demo"` or `"web-itch"`, sent on the session. At most 40 characters, no control characters, otherwise not sent. |
 | `game_version` | `1.0.0` | Sent with every session. |
 | `enabled` | `true` | `false` turns the SDK off for this run: no request of any kind, nothing queued, no `game_started`, until `set_enabled(true)`. Never saved. `set_tracking_enabled()` still saves the player's choice while it is `false`. |
 | `max_queue_size` | `500` | Unsent events kept. The oldest are dropped first; a queued `game_started` is kept. |
@@ -71,7 +77,8 @@ It is safe to call from any autoload, even before Ravensight's own
 | `quit(exit_code = 0)` | Send `game_exited` and the queue, then quit. Call it from your own Quit button instead of `get_tree().quit()`. |
 | `submit_feedback(message, category = "", rating = 0)` | Send player feedback. `category` is optional and one of `FEEDBACK_CATEGORIES`: `bug`, `suggestion`, `complaint`, `praise`, `playtest`, `other`. `rating` is 0 to leave it out, or a whole number from 1 to 5. Needs an open session. |
 | `set_tracking_enabled(on)` | The player's opt-out, saved across launches. See Player privacy. |
-| `is_tracking_enabled()` | `true` while events are collected: enabled, not opted out, kill switch on. |
+| `is_tracking_enabled()` | `true` while events are collected: a key, enabled, not opted out (or opted in), kill switch on, key accepted. |
+| `is_enabled()` | The same answer as `is_tracking_enabled()`. Use it to skip work that only feeds analytics. |
 | `reset_device_id()` | Start a fresh analytics identity for this install. Returns the new id. |
 | `set_enabled(on)` | The game's own switch for this run (see `enabled`). |
 | `get_status_reason()` | Why nothing is being sent, or `""`. See Startup and failures. |
@@ -91,13 +98,13 @@ this token and have it send it as `joinToken` when it opens its own session
 | --- | --- | --- |
 | `session_ready` | | A session is open. |
 | `session_failed` | `reason` | Opening a session failed: `"invalid_key"` for a refused key, otherwise the server's error code or `"offline"`. Retried for you unless the key was refused. |
-| `tracking_disabled` | `source` | `"server"` for the kill switch, `"player"` after an opt-out, `"init"` when `enabled` is `false` or after `set_enabled(false)`. |
+| `tracking_disabled` | `source` | `"server"` for the kill switch, `"player"` after an opt-out (or a start with `consent = "opt_in"` and no yes yet), `"init"` when `enabled` is `false` or after `set_enabled(false)`, `"key"` when the server refused the ingest key and the run ended. |
 | `status_changed` | `reason` | `get_status_reason()` changed. |
 | `events_flushed` | `count` | A batch was accepted. `count` is the number sent; the server may store fewer, e.g. it drops events older than 90 days. |
-| `flush_failed` | `reason` | A batch failed. It is retried for you, except one event the server refuses with 400, which is dropped. |
+| `flush_failed` | `reason` | A batch failed. It is retried for you, except one event the server refuses with 400, which is dropped. `"event_too_large"` for an event whose data is over 8,192 bytes as JSON, dropped before it was queued. |
 | `feedback_submitted` | | Feedback was accepted. |
 | `feedback_failed` | `reason` | Feedback failed: `"disabled"`, `"empty_message"`, `"invalid_category"`, `"invalid_rating"` or `"no_session"` before sending (no request is made), or the server's error code. |
-| `event_tracked` | `name, data` | Every queued event, with the data actually queued. |
+| `event_tracked` | `name, data` | Every queued event, with the data actually queued (a copy carrying `rs_event_id`). |
 | `suggestions_received` | `suggestions` | The answer to `fetch_suggestions()`. |
 
 ## Automatic events
@@ -157,10 +164,11 @@ fires when that changes:
 | Reason | Meaning |
 | --- | --- |
 | `""` | Nothing is wrong: a session is open, or opening normally. |
-| `disabled` | `enabled` is `false`, or the player opted out. |
-| `invalid_key` | The server refused the ingest key (401, or a 403 that is not one of the codes below). Logged once as `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.` Automatic sending stops for the run; events keep queueing and `flush()` tries once more. |
+| `no_key` | Started with no ingest key. Inert for the run. |
+| `disabled` | `enabled` is `false`, the player opted out, or `consent = "opt_in"` and the player has not said yes. |
+| `invalid_key` | The server refused the ingest key (401, or a 403 that is not one of the codes below), on the settings check, the session, a batch or feedback. Logged once as `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.` The run ends: the queue is cleared, nothing is retried, and `flush()` sends nothing. A 401 on a batch is an expired session instead: the SDK opens a new one first. |
 | `tracking_disabled` | The kill switch is off for your game. The queue is dropped and nothing more is sent this run. |
-| `offline` | No answer (no connection, or no reply within 15 seconds). Retried after 10 seconds, doubling up to 5 minutes; events are kept. |
+| `offline` | No answer (no connection, or no reply within 15 seconds). Retried after 10 seconds, doubling up to 5 minutes, each wait spread by plus or minus 20 percent; events are kept. |
 | `rate_limited` | The server said slow down (429, or 503 with Retry-After). The SDK waits exactly the Retry-After time. |
 | `session_failed` | Opening a session failed for another reason (retried with the same backoff), or a playtest token was refused. |
 | `playtest_job_closed` | The playtest job this run belongs to has closed. Nothing more is sent. |
@@ -170,6 +178,68 @@ event is alone, then it is dropped and reported on `flush_failed`, so it
 never costs the events around it. Events can be lost: the oldest go when
 more than `max_queue_size` are waiting, and whatever is still unsent when the
 game quits is not saved for the next launch.
+
+## Public builds
+
+For a game anyone can download, fork or play in a browser: a demo, a game
+jam entry, an open source project. Nothing here changes a game that sets a
+key and none of these options.
+
+- **No key, no analytics.** With an empty `ingest_key` (the default) and no
+  `ravensight/ingest_key` project setting, the SDK is inert: it writes no
+  files, makes no request, runs no timer, leaves the window close alone,
+  and every call is a quiet no-op. It prints one warning;
+  `optional = true` silences it. `get_status_reason()` is `"no_key"`. So
+  a public repository can ship with no key in it, and a clone or a
+  development build sends nothing.
+- **Inject the key at build time, never commit it.** Use a public
+  `gt_pub_` key for builds anyone can download. Leave `ingest_key` empty in
+  the repository and have your release step add the project setting on the
+  build machine's copy only, just before the export:
+
+  ```bash
+  printf '\n[ravensight]\n\ningest_key="%s"\n' "$RAVENSIGHT_PUBLIC_KEY" >> project.godot
+  godot --headless --export-release "Windows Desktop" build/game.exe
+  ```
+
+  Do not commit that change. `ravensight/ingest_key` is read only when
+  `ingest_key` itself is empty.
+- **`is_enabled()`** is true only while the SDK is collecting: it has a
+  key, and nobody switched it off (`enabled`, the player, the opt-in
+  consent, the server, or a refused key).
+- **`consent = "opt_in"`** sends nothing until the player says yes: no
+  device id is made, and not even the settings check is sent, before
+  `set_tracking_enabled(true)`. The yes is saved as
+  `user://ravensight_optin.save`, and `set_tracking_enabled(false)` removes
+  it. The default, `"opt_out"`, keeps the 0.2.0 behaviour. Events tracked
+  before the yes are dropped, not held for later; events tracked right
+  after it are queued while the settings check runs. `device_id` is `""`
+  before the first yes. Saying no again stops everything but keeps the
+  device id; to forget it too, call `reset_device_id()`. Set `consent`
+  with the other options, before Ravensight's `_ready()`.
+- **`distribution`** is a short label of your own, such as
+  `"steam-release"`, `"itch-demo"` or `"web-itch"`, sent on the session so
+  you can tell builds apart. It is not sent when unset.
+- **`rs_event_id`** is added to every event's data: the first 16
+  characters of the device id, the launch time in hex, a random 8 hex
+  character value made once per launch from the secure random source, and
+  a counter. An event sent again after a failure carries the same id, so
+  the server can recognise it. The SDK does not save its queue between
+  launches.
+- **Size cap.** An event whose data is over 8,192 bytes as JSON is dropped
+  before it is queued, with one warning for the run and
+  `flush_failed("event_too_large")` for each.
+- **A refused key ends the run.** A 401 or 403 on the settings check or the
+  session (other than the kill switch or a refused playtest token) clears
+  the queue and stops; a later `set_tracking_enabled(true)` saves the
+  choice and restarts nothing.
+
+## Compatibility
+
+| ravensight-godot | Godot | API | Notes |
+| --- | --- | --- | --- |
+| 0.2.0 | 4.x (CI on 4.5-stable) | `/api/v1` | The shared SDK contract. |
+| 0.3.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
 
 ## Levels and deaths
 
@@ -188,7 +258,8 @@ Ravensight.track_event("boss_phase_begin", {"level": "castle", "rs_kind": "none"
 Ravensight.track_event("run_over", {"level": "castle", "rs_kind": "death"})
 ```
 
-Keys that start with `rs_` are reserved for Ravensight.
+Keys that start with `rs_` are reserved for Ravensight. The SDK sets
+`rs_event_id` itself.
 
 ## Player privacy
 
@@ -256,8 +327,8 @@ bash check-gdscript.sh path/to/godot Ravensight.gd   # the parse check
 ```
 
 `tests/run.sh` wraps `godot --headless --script tests/run.gd`, because
-Godot's command line exits 0 even when a script fails to parse. For 0.2.0
-both were run on macOS with Godot v4.8.dev1 (205 checks in 36 tests, all
+Godot's command line exits 0 even when a script fails to parse. For 0.3.0
+both were run on macOS with Godot v4.8.dev1 (320 checks in 51 tests, all
 passing). CI runs both with Godot 4.5-stable on every push
 (`.github/workflows/parse.yml`). The tests replace the network layer; for
 0.2.0 the real `HTTPRequest` path was also run once, by hand, against a
