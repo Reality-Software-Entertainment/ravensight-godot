@@ -58,6 +58,21 @@ func _run() -> void:
 		"test_cold_launch_marker",
 		"test_cold_launch_marker_expired_or_opted_out",
 		"test_desktop_focus_out_sends_nothing_new",
+		"test_no_key_is_inert",
+		"test_no_key_optional_is_silent",
+		"test_no_key_reads_project_setting_fallback",
+		"test_opt_in_before_yes_does_nothing",
+		"test_opt_in_after_yes_starts_and_queues",
+		"test_opt_in_revoke_keeps_device_id",
+		"test_opt_in_saved_yes_starts_next_launch",
+		"test_distribution_on_session_body",
+		"test_batch_403_ends_run",
+		"test_jitter_bounds",
+		"test_retry_after_not_jittered",
+		"test_rs_event_id_shape_and_resend",
+		"test_rs_event_id_stable_prefix_across_launches",
+		"test_event_over_8kb_dropped",
+		"test_default_key_only_unchanged",
 	]
 	for name in tests:
 		_current = name
@@ -172,7 +187,12 @@ func test_api_base_forms() -> void:
 	eq(fresh.api_url, "https://api.ravensight.io", "default api_url is the bare host")
 	eq(Fake.REQUEST_TIMEOUT_SECONDS, 15.0, "request timeout")
 	eq(fresh.max_queue_size, 500, "default queue cap")
-	eq(Fake.VERSION, "0.2.0", "version constant")
+	eq(Fake.VERSION, "0.3.0", "version constant")
+	var plain: Node = load("res://Ravensight.gd").new()
+	eq(plain.ingest_key, "", "default ingest_key is empty")
+	eq(plain.consent, "opt_out", "default consent")
+	eq(plain.distribution, "", "default distribution")
+	plain.free()
 	sdk.free()
 	fresh.free()
 
@@ -294,33 +314,45 @@ func test_suggestions_and_feedback_while_disabled() -> void:
 
 func test_settings_401_one_request_then_none() -> void:
 	var sdk := start()
+	sdk.track_event("before_answer")
 	sdk.answer(401, {"error": "invalid_api_key"})
+	eq(sdk.pending_events.size(), 0, "the queue is cleared")
 	for i in 60:
 		sdk.track_event("e%d" % i)
 	sdk.advance(30.0)
 	sdk.advance(600.0)
 	eq(sdk.requests.size(), 1, "one request, then none")
 	eq(sdk.get_status_reason(), "invalid_key", "reason")
-	eq(sdk.pending_events.size(), 61, "the queue is kept")
+	eq(sdk.pending_events.size(), 0, "events after the refusal are dropped")
+	check(signal_args("tracking_disabled").has("key"), "tracking_disabled(key)")
+	eq(sdk.is_enabled(), false, "is_enabled() false")
 	sdk.flush()
-	eq(sdk.paths(), ["/settings", "/session"], "an explicit flush makes one more attempt")
-	sdk.answer(401, {"error": "invalid_api_key"})
+	sdk.submit_feedback("hi")
+	sdk.set_tracking_enabled(true)
 	sdk.advance(600.0)
-	eq(sdk.requests.size(), 2, "and stops again")
+	eq(sdk.requests.size(), 1, "flush, feedback and a yes make no request: the run has ended")
+	sdk.quit()
+	eq(sdk.quit_codes, [0], "quit still quits")
 
 func test_session_401_invalid_key_keeps_queue() -> void:
+	# Kept name: a refused key on POST /session now ends the run.
 	var sdk := start()
 	sdk.answer(200, {"trackingEnabled": true})
 	sdk.answer(403, {"error": "forbidden"})
 	eq(sdk.get_status_reason(), "invalid_key", "a 403 that is not a known code is invalid_key")
 	check(signal_args("session_failed").has("invalid_key"), "session_failed(invalid_key)")
+	check(signal_args("tracking_disabled").has("key"), "tracking_disabled(key)")
+	eq(sdk.pending_events.size(), 0, "queue cleared")
 	sdk.advance(600.0)
-	eq(sdk.requests.size(), 2, "no retry")
-	eq(queued_names(sdk), ["game_started"], "queue kept")
+	sdk.track_event("later")
 	sdk.flush()
-	sdk.answer_all_ok()
-	eq(sdk.get_status_reason(), "", "a session that opens clears the reason")
-	eq(sdk.pending_events.size(), 0, "and the queue drains")
+	sdk.advance(600.0)
+	eq(sdk.requests.size(), 2, "no retry, no further request")
+	var again := start()
+	again.answer(200, {"trackingEnabled": true})
+	again.answer(401, {"error": "invalid_api_key"})
+	eq(again.get_status_reason(), "invalid_key", "a session 401 ends the run too")
+	eq(again.pending_events.size(), 0, "and clears the queue")
 
 func test_session_403_tracking_disabled_stops() -> void:
 	var sdk := start()
@@ -748,3 +780,281 @@ func test_later_enable_stamps_game_started_now() -> void:
 	quitter.quit()
 	eq(quitter.quit_codes, [0], "quit() before the node is in the tree does not crash")
 	quitter.free()
+
+# --- public builds (0.3.0) -----------------------------------------------------------
+
+func _storage_files() -> Array:
+	var dir := DirAccess.open(Fake.TEST_STORAGE_DIR)
+	return Array(dir.get_files()) if dir else []
+
+## The events of every batch sent so far, in order.
+func _sent_events(sdk: Fake) -> Array:
+	var out: Array = []
+	for r in sdk.requests:
+		if r["path"] == "/track/batch":
+			out.append_array(sdk.events_in(r))
+	return out
+
+func test_no_key_is_inert() -> void:
+	var sdk := make({"ingest_key": ""})
+	sdk.track_event("from_an_earlier_autoload")
+	root.add_child(sdk)
+	sdk.track_event("level_start", {"level": "1"})
+	sdk.flush()
+	sdk.submit_feedback("hi", "bug", 3)
+	sdk.fetch_suggestions()
+	sdk.set_enabled(false)
+	sdk.set_enabled(true)
+	sdk.reset_device_id()
+	sdk.advance(3600.0)
+	eq(sdk.requests.size(), 0, "no request of any kind")
+	eq(sdk.pending_events.size(), 0, "nothing queued")
+	eq(_storage_files(), [], "no file written")
+	eq(sdk.device_id, "", "no device id made")
+	eq(sdk.is_enabled(), false, "is_enabled() false")
+	eq(sdk.is_tracking_enabled(), false, "is_tracking_enabled() false")
+	eq(sdk.get_status_reason(), "no_key", "reason no_key")
+	check(sdk._logged_once.has("no_key"), "one warning")
+	eq(sdk.is_processing(), false, "no per-frame timer")
+	eq(sdk._owns_close_quit, false, "the window close is left to the engine")
+	sdk.quit()
+	eq(sdk.quit_codes, [0], "quit still quits")
+	# A whitespace-only key counts as none.
+	var spaces := start({"ingest_key": "   "})
+	eq(spaces.get_status_reason(), "no_key", "whitespace key is no key")
+	eq(spaces.requests.size(), 0, "and sends nothing")
+
+func test_no_key_optional_is_silent() -> void:
+	var sdk := start({"ingest_key": "", "optional": true})
+	check(not sdk._logged_once.has("no_key"), "optional = true prints no warning")
+	eq(sdk.get_status_reason(), "no_key", "still inert")
+	eq(sdk.requests.size(), 0, "no request")
+	# The player's choice is still saved while inert, and nothing starts.
+	sdk.set_tracking_enabled(false)
+	eq(_read("ravensight_optout.save"), "1", "the choice is saved")
+	sdk.set_tracking_enabled(true)
+	eq(sdk.requests.size(), 0, "and a yes starts nothing")
+	eq(_storage_files(), [], "the opt-out file is removed again, no other file")
+
+func test_no_key_reads_project_setting_fallback() -> void:
+	ProjectSettings.set_setting("ravensight/ingest_key", "gt_pub_from_settings")
+	var sdk := start({"ingest_key": ""})
+	ProjectSettings.set_setting("ravensight/ingest_key", null)
+	eq(sdk.ingest_key, "gt_pub_from_settings", "the project setting fills an empty key")
+	eq(sdk.paths(), ["/settings"], "and the SDK starts")
+	eq(sdk.header(sdk.requests[0], "X-API-Key"), "gt_pub_from_settings", "with that key")
+
+func test_opt_in_before_yes_does_nothing() -> void:
+	var sdk := make({"consent": "opt_in"})
+	sdk.track_event("from_an_earlier_autoload")
+	root.add_child(sdk)
+	sdk.track_event("before_yes")
+	sdk.flush()
+	sdk.submit_feedback("hi")
+	sdk.advance(3600.0)
+	eq(sdk.requests.size(), 0, "no settings check, no session, no request")
+	eq(sdk.pending_events.size(), 0, "events before the yes are dropped")
+	eq(_storage_files(), [], "no device id, no file")
+	eq(sdk.device_id, "", "device_id empty before the yes")
+	eq(sdk.is_enabled(), false, "is_enabled() false")
+	eq(sdk.get_status_reason(), "disabled", "reason disabled")
+	check(signal_args("tracking_disabled").has("player"), "tracking_disabled(player)")
+	eq(sdk.reset_device_id(), "", "reset before the yes makes no id")
+	eq(_storage_files(), [], "and writes nothing")
+
+func test_opt_in_after_yes_starts_and_queues() -> void:
+	var sdk := start({"consent": "opt_in"})
+	sdk.track_event("before_yes")
+	sdk.set_tracking_enabled(true)
+	eq(_read("ravensight_optin.save"), "1", "the yes is saved")
+	check(_read("device_id.save").length() > 33, "the device id is made now")
+	eq(sdk.device_id, _read("device_id.save"), "and in use")
+	eq(sdk.paths(), ["/settings"], "the settings check runs on the yes")
+	sdk.track_event("right_after_yes")
+	eq(queued_names(sdk), ["game_started", "right_after_yes"], "events right after the yes are queued while the check runs")
+	sdk.answer_all_ok()
+	eq(sdk.paths(), ["/settings", "/session", "/track/batch"], "then session and batch")
+	var names := _sent_events(sdk).map(func(e): return e["event"])
+	eq(names, ["game_started", "right_after_yes"], "the event before the yes was never sent")
+	eq(sdk.is_enabled(), true, "is_enabled() true")
+	check(not FileAccess.file_exists(_file("ravensight_optout.save")), "opt_in never writes the opt-out file")
+
+func test_opt_in_revoke_keeps_device_id() -> void:
+	var sdk := start({"consent": "opt_in"})
+	sdk.set_tracking_enabled(true)
+	sdk.answer_all_ok()
+	var id := sdk.device_id
+	var before := sdk.requests.size()
+	sdk.set_tracking_enabled(false)
+	check(not FileAccess.file_exists(_file("ravensight_optin.save")), "the yes is removed")
+	eq(_read("device_id.save"), id, "the device id is kept")
+	sdk.track_event("after_no")
+	sdk.flush()
+	sdk.advance(600.0)
+	eq(sdk.requests.size(), before, "nothing sent after the no")
+	eq(sdk.reset_device_id(), "", "reset after the no forgets the id")
+	check(not FileAccess.file_exists(_file("device_id.save")), "and deletes it")
+
+func test_opt_in_saved_yes_starts_next_launch() -> void:
+	_write("ravensight_optin.save", "1")
+	var sdk := start({"consent": "opt_in"})
+	eq(sdk.paths(), ["/settings"], "a saved yes starts at once")
+	check(not sdk.device_id.is_empty(), "with a device id")
+	# The default mode ignores the opt-in file and still honours an opt-out.
+	_clean_storage()
+	_write("ravensight_optout.save", "1")
+	var plain := start({"consent": "opt_out"})
+	eq(plain.requests.size(), 0, "opt_out with a saved opt-out sends nothing")
+	var odd := start({"consent": "something_else"})
+	eq(odd.requests.size(), 0, "an unknown consent value counts as opt_out")
+
+func test_distribution_on_session_body() -> void:
+	var sdk := start({"distribution": "web-itch"})
+	sdk.answer_all_ok()
+	var body = JSON.parse_string(sdk.requests[1]["body"])
+	eq(sdk.requests[1]["path"], "/session", "second request is the session")
+	eq(body.get("distribution"), "web-itch", "distribution on the session body")
+	for bad in ["x".repeat(41), "line\nbreak", "tab\there"]:
+		_clean_storage()
+		var other := start({"distribution": bad})
+		other.answer_all_ok()
+		var b = JSON.parse_string(other.requests[1]["body"])
+		check(not b.has("distribution"), "invalid distribution not sent: %s" % bad.c_escape())
+		check(other._logged_once.has("bad_distribution"), "and warned once")
+	var forty := start({"distribution": "y".repeat(40)})
+	forty.answer_all_ok()
+	eq(JSON.parse_string(forty.requests[1]["body"]).get("distribution"), "y".repeat(40), "40 characters is accepted")
+	var none := start()
+	none.answer_all_ok()
+	check(not JSON.parse_string(none.requests[1]["body"]).has("distribution"), "unset sends no distribution key")
+
+func test_batch_403_ends_run() -> void:
+	var sdk := started_with_session()
+	sdk.track_event("x")
+	sdk.flush()
+	sdk.answer(403, {"error": "forbidden"})
+	eq(sdk.get_status_reason(), "invalid_key", "a batch 403 is a refused key")
+	eq(sdk.pending_events.size(), 0, "queue cleared")
+	var n := sdk.requests.size()
+	sdk.track_event("y")
+	sdk.flush()
+	sdk.advance(600.0)
+	eq(sdk.requests.size(), n, "nothing more is sent")
+
+func test_jitter_bounds() -> void:
+	# The lowest draw: 10 s less 20 percent.
+	var low := start()
+	low.fake_random = 0.0
+	low.answer(200, {"trackingEnabled": true})
+	low.answer(0, "")
+	low.advance(7.9)
+	eq(low.unanswered().size(), 0, "not before 8 s")
+	low.advance(0.2)
+	eq(low.unanswered().size(), 1, "retried by 8.1 s")
+	# The highest draw: 10 s plus 20 percent.
+	var high := start()
+	high.fake_random = 0.999999
+	high.answer(200, {"trackingEnabled": true})
+	high.answer(0, "")
+	high.advance(11.9)
+	eq(high.unanswered().size(), 0, "not before 11.9 s")
+	high.advance(0.2)
+	eq(high.unanswered().size(), 1, "retried by 12.1 s")
+	# Spread never passes the 5 minute cap.
+	var capped := start()
+	capped.fake_random = 0.999999
+	capped.answer(200, {"trackingEnabled": true})
+	for i in 8:
+		capped.answer(0, "")
+		capped.advance(400.0)
+	capped.answer(0, "")
+	capped.advance(300.0)
+	eq(capped.unanswered().size(), 1, "a capped wait is at most 300 s")
+
+func test_retry_after_not_jittered() -> void:
+	var sdk := start()
+	sdk.fake_random = 0.0
+	sdk.answer(200, {"trackingEnabled": true})
+	sdk.answer(429, {"error": "rate_limited"}, ["Retry-After: 30"])
+	sdk.advance(29.0)
+	eq(sdk.unanswered().size(), 0, "Retry-After 30 is not shortened")
+	sdk.advance(1.0)
+	eq(sdk.unanswered().size(), 1, "and is obeyed exactly")
+
+func test_rs_event_id_shape_and_resend() -> void:
+	var sdk := started_with_session()
+	var shape := RegEx.new()
+	shape.compile("^[A-Za-z0-9_-]{1,64}$")
+	var caller := {"level": "1"}
+	sdk.track_event("a", caller)
+	sdk.track_event("b")
+	check(not caller.has("rs_event_id"), "the caller's dictionary is not changed")
+	sdk.flush()
+	var first: Array = sdk.events_in(sdk.requests[sdk.requests.size() - 1])
+	sdk.answer(500, {"error": "internal_error"})
+	sdk.advance(10.0)
+	sdk.answer_all_ok()
+	var resent: Array = sdk.events_in(sdk.requests[sdk.requests.size() - 1])
+	eq(resent.map(func(e): return e["data"]["rs_event_id"]), first.map(func(e): return e["data"]["rs_event_id"]), "a resend carries the same ids")
+	var ids: Array = []
+	for e in _sent_events(sdk):
+		var id := str(e["data"].get("rs_event_id", ""))
+		check(shape.search(id) != null, "shape: %s" % id)
+		check(id.begins_with(sdk.device_id.substr(0, 16) + "-"), "prefix is the first 16 characters of the device id")
+		var parts := id.split("-")
+		eq(parts.size(), 4, "prefix, launch time, nonce, counter")
+		eq(parts[2].length(), 8, "an 8 hex character nonce")
+		if not ids.has(id):
+			ids.append(id)
+	eq(ids.size(), 3, "game_started, a and b have distinct ids")
+	# Playtest ids are made the same way from pt-<run id>.
+	var pt := started_with_session()
+	pt.set_playtest_context({"token": "tok", "run_id": "run.with spaces"})
+	pt.track_event("p")
+	var pid := str(pt.pending_events[pt.pending_events.size() - 1]["data"]["rs_event_id"])
+	check(shape.search(pid) != null, "a playtest id has the shape too: %s" % pid)
+
+func test_rs_event_id_stable_prefix_across_launches() -> void:
+	var one := started_with_session()
+	var id1 := str(_sent_events(one)[0]["data"]["rs_event_id"])
+	var two := started_with_session()
+	var id2 := str(_sent_events(two)[0]["data"]["rs_event_id"])
+	eq(id1.split("-")[0], id2.split("-")[0], "the per-install prefix survives a relaunch")
+	check(id1.split("-")[2] != id2.split("-")[2], "the nonce is new per launch")
+	# The first launch, with an event tracked before any device id existed.
+	_clean_storage()
+	var early := make()
+	early.track_event("before_ready")
+	eq(early.device_id, "", "no id before ready on a first launch")
+	root.add_child(early)
+	early.answer_all_ok()
+	for e in _sent_events(early):
+		check(str(e["data"].get("rs_event_id", "")).begins_with(early.device_id.substr(0, 16)), "stamped before sending: %s" % e["event"])
+
+func test_event_over_8kb_dropped() -> void:
+	var sdk := started_with_session()
+	var tracked: Array = []
+	sdk.event_tracked.connect(func(n, _d): tracked.append(n))
+	sdk.track_event("huge", {"blob": "x".repeat(8200)})
+	sdk.track_event("huge_again", {"blob": "x".repeat(9000)})
+	eq(queued_names(sdk), [], "too large events are never queued")
+	eq(signal_args("flush_failed").count("event_too_large"), 2, "flush_failed(event_too_large) for each")
+	check(sdk._logged_once.has("event_too_large"), "one warning")
+	eq(tracked, [], "and not announced on event_tracked")
+	# Just under the cap still goes.
+	sdk.track_event("fits", {"blob": "x".repeat(8000)})
+	eq(queued_names(sdk), ["fits"], "an event under 8,192 bytes is queued")
+	sdk.flush()
+	sdk.answer_all_ok()
+	eq(sent_count(sdk, "huge"), 0, "never sent")
+	eq(sent_count(sdk, "fits"), 1, "the one that fits is sent")
+
+func test_default_key_only_unchanged() -> void:
+	# A game that passes only a key: no new file, the 0.2.0 requests.
+	var sdk := started_with_session()
+	var files := _storage_files()
+	files.sort()
+	eq(files, ["device_id.save"], "only the device id file, as in 0.2.0")
+	eq(sdk.paths(), ["/settings", "/session", "/track/batch"], "settings, session, batch")
+	var body = JSON.parse_string(sdk.requests[1]["body"])
+	eq(body.keys().size(), 3, "the session body has deviceId, gameVersion, platform only")

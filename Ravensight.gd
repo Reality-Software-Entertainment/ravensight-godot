@@ -5,14 +5,16 @@
 # Setup: Project -> Project Settings -> Autoload -> add this script,
 # name it "Ravensight", enable it. Then set `ingest_key` (and `api_url` if
 # you do not use https://api.ravensight.io) before the autoload's _ready()
-# runs, e.g. from an earlier autoload, or by editing the defaults below.
+# runs, e.g. from an earlier autoload, by editing the defaults below, or
+# through the project setting ravensight/ingest_key. With no key the SDK is
+# inert: no files, no requests, every call a no-op.
 #
 # Full guide: https://ravensight.io/docs/#godot-sdk
 
 extends Node
 
 ## The SDK version. Bumped with every tagged release.
-const VERSION := "0.2.0"
+const VERSION := "0.3.0"
 
 ## --- Signals -------------------------------------------------------------
 
@@ -22,11 +24,13 @@ signal session_ready
 ## ingest key was refused, otherwise the server's error code (or "offline").
 signal session_failed(reason: String)
 ## Emitted when tracking turns off: source "server" for the kill switch,
-## "player" for the player's opt-out (set_tracking_enabled(false)), "init"
-## when the game turned the SDK off (enabled = false or set_enabled(false)).
+## "player" for the player's opt-out (set_tracking_enabled(false)) or, with
+## consent = "opt_in", for a start with no yes saved yet, "init" when the
+## game turned the SDK off (enabled = false or set_enabled(false)), "key"
+## when the server refused the ingest key and the run ended.
 signal tracking_disabled(source: String)
 ## Emitted whenever get_status_reason() changes. `reason` is one of
-## "disabled", "invalid_key", "tracking_disabled", "offline",
+## "no_key", "disabled", "invalid_key", "tracking_disabled", "offline",
 ## "rate_limited", "session_failed", "playtest_job_closed", or "" when
 ## nothing is wrong.
 signal status_changed(reason: String)
@@ -36,6 +40,8 @@ signal status_changed(reason: String)
 signal events_flushed(count: int)
 ## Emitted when a batch flush attempt fails (it is retried automatically,
 ## except a single event the server refuses with 400, which is dropped).
+## Also emitted with "event_too_large" for an event whose data is over
+## MAX_EVENT_BYTES as JSON, which is dropped before it is queued.
 signal flush_failed(reason: String)
 ## Emitted when a feedback submission is accepted.
 signal feedback_submitted
@@ -58,13 +64,32 @@ signal event_tracked(event_name: String, data: Dictionary)
 ## without a trailing slash: see api_base(). Empty means the default.
 @export var api_url: String = "https://api.ravensight.io"
 
-## Your game's PUBLISHABLE ingest key (format: gt_live_...), copied from the
-## Ravensight dashboard when you created the game. This key is safe to ship
-## inside your game binary: it can open sessions, read the tracking kill
-## switch and read this game's design suggestions. It can NOT read
-## analytics, feedback, or manage your account. Rotate it from the
-## dashboard if it ever needs to change.
-@export var ingest_key: String = "gt_live_your_ingest_key_here"
+## Your game's PUBLISHABLE ingest key (gt_live_... or, for a build anyone
+## can download, a public gt_pub_... key), copied from the Ravensight
+## dashboard. This key is safe to ship inside your game binary: it can open
+## sessions, read the tracking kill switch and read this game's design
+## suggestions. It can NOT read analytics, feedback, or manage your account.
+## Rotate it from the dashboard if it ever needs to change.
+## Empty (the default) falls back to the project setting
+## ravensight/ingest_key; empty there too, the SDK is inert for the run: it
+## writes no files, makes no request and every call is a quiet no-op.
+@export var ingest_key: String = ""
+
+## True silences the one warning an inert start (no key) prints.
+@export var optional: bool = false
+
+## "opt_out" (the default): tracking runs until the player turns it off.
+## "opt_in": nothing happens before the player's yes through
+## set_tracking_enabled(true): no device id, no settings check, no session,
+## and events tracked before the yes are dropped. The yes is saved at
+## OPTIN_PATH. Anything else counts as "opt_out".
+@export var consent: String = "opt_out"
+
+## A short label of your own for this build, such as "native-release",
+## "web-itch" or "steam-demo", sent on the session as `distribution`. At
+## most 40 characters, no control characters; anything else is not sent
+## (one warning). Empty sends nothing.
+@export var distribution: String = ""
 
 ## Reported to the server as the client's game version.
 @export var game_version: String = "1.0.0"
@@ -93,6 +118,15 @@ signal event_tracked(event_name: String, data: Dictionary)
 const MAX_BATCH_SIZE: int = 50          # server hard limit on /track/batch
 const DEFAULT_RETRY_SECONDS: float = 10.0
 const MAX_BACKOFF_SECONDS: float = 300.0  # cap exponential backoff at 5 min
+## Backoff waits are spread by plus or minus this fraction, so many games
+## that failed together do not retry together. Retry-After is never spread.
+const JITTER: float = 0.2
+## The largest event the API accepts, measured as the server measures it:
+## the JSON of the event's data. Bigger events are dropped before queueing.
+const MAX_EVENT_BYTES: int = 8192
+const MAX_DISTRIBUTION_LENGTH: int = 40
+const CONSENT_OPT_OUT := "opt_out"
+const CONSENT_OPT_IN := "opt_in"
 ## Every request gives up after this long and counts as offline.
 const REQUEST_TIMEOUT_SECONDS: float = 15.0
 ## A batch 401 reopens the session at most this many times in a row.
@@ -104,6 +138,8 @@ const FEEDBACK_CATEGORIES: Array[String] = ["bug", "suggestion", "complaint", "p
 const DEVICE_ID_PATH: String = "user://device_id.save"
 ## Present only while the player has opted out (see set_tracking_enabled).
 const OPTOUT_PATH: String = "user://ravensight_optout.save"
+## With consent = "opt_in": present only once the player has said yes.
+const OPTIN_PATH: String = "user://ravensight_optin.save"
 ## Present only while the app is in the background on Android or iOS.
 const BACKGROUND_MARKER_PATH: String = "user://ravensight_bg.save"
 const INVALID_KEY_MESSAGE := "Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key."
@@ -139,9 +175,17 @@ var _player_opted_out: bool = false
 ## The server kill switch said off (settings check or a 403
 ## tracking_disabled). Final for the rest of the run.
 var _killed: bool = false
-## The server refused the ingest key. Automatic sending stops for the run;
-## events keep queueing and an explicit flush() tries once more.
+## The server refused the ingest key (401 or 403 that is not the kill
+## switch or a playtest refusal). Final for the rest of the run.
 var _key_refused: bool = false
+## Started with no ingest key: inert for the rest of the run.
+var _no_key: bool = false
+## The distribution label actually sent, after validation.
+var _distribution: String = ""
+## rs_event_id parts: a per-launch nonce from the secure random source and
+## a counter.
+var _event_nonce: String = ""
+var _event_counter: int = 0
 var _settings_checked: bool = false
 var _settings_pending: bool = false
 ## Set at the end of _ready(). Before that, track_event() only queues.
@@ -243,17 +287,39 @@ func _init() -> void:
 	_start_unix = _unix_now()
 	_apply_playtest_env()
 	if playtest_token.is_empty():
-		device_id = _load_or_create_device_id()
+		# Read only: a saved id is used, but none is created before _ready()
+		# knows there is a key and, with consent = "opt_in", a yes.
+		device_id = _read_saved_device_id()
 		# Read now, so a track_event() or set_tracking_enabled() from an
 		# earlier autoload already sees the player's choice.
-		_player_opted_out = FileAccess.file_exists(_path(OPTOUT_PATH))
+		_player_opted_out = not _saved_choice()
 
 func _ready() -> void:
+	_is_ready = true
+	if ingest_key.strip_edges().is_empty():
+		ingest_key = str(ProjectSettings.get_setting("ravensight/ingest_key", "")).strip_edges()
+	if ingest_key.strip_edges().is_empty():
+		# A keyless clone or a development build: inert, not an error. No
+		# file, no request, no timer, and the window close is left alone.
+		_no_key = true
+		_clear_queue()
+		set_process(false)
+		if not optional:
+			_log_once("no_key", "Ravensight: no ingest_key, so analytics is off for this run (set optional = true to silence this line)", true)
+		_update_reason()
+		return
 	# Keep the timers running while the game is paused, so a paused game
 	# still sends and still quits.
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_take_over_quit()
-	_is_ready = true
+	_distribution = _validated_distribution()
+
+	if playtest_token.is_empty():
+		# The game may have set `consent` after construction: read the
+		# choice again for the final mode.
+		_player_opted_out = not _saved_choice()
+		if not _player_opted_out:
+			_load_identity()
 
 	_send_exit_marker_if_any()
 
@@ -271,7 +337,10 @@ func _ready() -> void:
 		# Nothing leaves the device, not even the settings check, and
 		# anything an earlier autoload tracked is dropped.
 		_clear_queue()
-		print("Ravensight: tracking disabled by player opt-out")
+		if _consent_mode() == CONSENT_OPT_IN:
+			print("Ravensight: waiting for the player to opt in (consent = \"opt_in\")")
+		else:
+			print("Ravensight: tracking disabled by player opt-out")
 		_update_reason()
 		tracking_disabled.emit("player")
 		return
@@ -472,12 +541,66 @@ func _load_or_create_device_id() -> String:
 	# derived from the hardware or OS install; such an id is replaced with a
 	# fresh random one (and saved) so an upgraded install carries no hardware
 	# identifier either. That install starts a new analytics identity.
-	var saved_id := _read_text(DEVICE_ID_PATH).strip_edges()
-	if _is_random_device_id(saved_id):
+	var saved_id := _read_saved_device_id()
+	if not saved_id.is_empty():
 		return saved_id
 	var new_id := _generate_device_id()
 	_write_text(DEVICE_ID_PATH, new_id)
 	return new_id
+
+## The saved device id when it has the random shape, otherwise "". Never
+## writes.
+func _read_saved_device_id() -> String:
+	var saved_id := _read_text(DEVICE_ID_PATH).strip_edges()
+	return saved_id if _is_random_device_id(saved_id) else ""
+
+## Makes sure this install has a device id: called once there is a key and
+## the player's choice allows it. Events queued before it get their
+## rs_event_id here.
+func _load_identity() -> void:
+	if not playtest_token.is_empty():
+		return
+	if device_id.is_empty():
+		device_id = _load_or_create_device_id()
+	_stamp_event_ids()
+
+## --- Consent ------------------------------------------------------------------
+
+## "opt_in" or "opt_out" from the consent option; anything else is opt_out.
+func _consent_mode() -> String:
+	return CONSENT_OPT_IN if consent == CONSENT_OPT_IN else CONSENT_OPT_OUT
+
+## The player's saved choice for the consent mode: true when tracking may
+## run. opt_out: on unless an opt-out was saved. opt_in: off unless a yes
+## was saved.
+func _saved_choice() -> bool:
+	if _consent_mode() == CONSENT_OPT_IN:
+		return FileAccess.file_exists(_path(OPTIN_PATH))
+	return not FileAccess.file_exists(_path(OPTOUT_PATH))
+
+## Saves the player's choice in the file the consent mode reads.
+func _save_choice(on: bool) -> void:
+	if _consent_mode() == CONSENT_OPT_IN:
+		if on:
+			_write_text(OPTIN_PATH, "1")
+		else:
+			_remove_file(OPTIN_PATH)
+	elif on:
+		_remove_file(OPTOUT_PATH)
+	else:
+		_write_text(OPTOUT_PATH, "1")
+
+## The distribution option when it is valid, otherwise "" (one warning).
+func _validated_distribution() -> String:
+	var label := distribution.strip_edges()
+	if label.is_empty():
+		return ""
+	var control := RegEx.new()
+	control.compile("[\\x00-\\x1f\\x7f]")
+	if label.length() > MAX_DISTRIBUTION_LENGTH or control.search(label) != null:
+		_log_once("bad_distribution", "Ravensight: distribution must be at most %d characters with no control characters; it is not sent" % MAX_DISTRIBUTION_LENGTH, true)
+		return ""
+	return label
 
 ## True when `id` has the shape _generate_device_id() produces: exactly 32
 ## lowercase hex characters, a dash, then the lowercased OS name. A legacy
@@ -537,6 +660,14 @@ func _now() -> float:
 ## Unix seconds, for event timestamps and session expiry.
 func _unix_now() -> int:
 	return int(Time.get_unix_time_from_system())
+
+## 0 <= x < 1, for backoff jitter.
+func _random() -> float:
+	return randf()
+
+## 4 bytes from the platform's secure random source as 8 hex characters.
+func _random_nonce() -> String:
+	return Crypto.new().generate_random_bytes(4).hex_encode()
 
 ## Every request the SDK makes goes through here. `path` is relative to
 ## api_base(); `callback` is called with (status, headers, body), where
@@ -722,8 +853,6 @@ func _start_session(explicit: bool = false) -> void:
 		return
 	if _session_request_pending or device_id.is_empty():
 		return
-	if _key_refused and not explicit:
-		return
 	if not _can_send_now(explicit):
 		return
 	_session_request_pending = true
@@ -736,12 +865,14 @@ func _start_session(explicit: bool = false) -> void:
 		headers.append("X-Ravensight-Playtest: " + playtest_token)
 		platform = "ravensight-playtest"
 
-	var body := JSON.stringify({
+	var session_body := {
 		"deviceId": device_id,
 		"gameVersion": game_version,
 		"platform": platform,
-	})
-	_send("POST", "/session", headers, body, _on_session_response.bind(generation))
+	}
+	if not _distribution.is_empty():
+		session_body["distribution"] = _distribution
+	_send("POST", "/session", headers, JSON.stringify(session_body), _on_session_response.bind(generation))
 
 func _on_session_response(code: int, headers: PackedStringArray, body: PackedByteArray, generation: int) -> void:
 	# A newer session attempt has started (or the session was dropped) since
@@ -762,7 +893,6 @@ func _on_session_response(code: int, headers: PackedStringArray, body: PackedByt
 			_backoff_seconds = DEFAULT_RETRY_SECONDS
 			# A success ends any wait an explicit flush cut short.
 			_stop_retry()
-			_key_refused = false
 			_transient_reason = ""
 			_update_reason()
 			print("Ravensight: session ready")
@@ -808,13 +938,16 @@ func _on_session_response(code: int, headers: PackedStringArray, body: PackedByt
 
 ## Waits before the next automatic attempt: `server_wait_seconds` exactly
 ## when the server gave one (Retry-After), otherwise the backoff, which
-## starts at 10 seconds and doubles up to 5 minutes.
+## starts at 10 seconds and doubles up to 5 minutes, spread by plus or
+## minus JITTER (never past 5 minutes).
 func _schedule_retry(server_wait_seconds: float = -1.0) -> void:
 	var wait := _backoff_seconds
 	if server_wait_seconds >= 0.0:
 		wait = server_wait_seconds
 		_retry_from_server = true
 	else:
+		var factor := 1.0 - JITTER + 2.0 * JITTER * _random()
+		wait = minf(_backoff_seconds * factor, MAX_BACKOFF_SECONDS)
 		_backoff_seconds = minf(_backoff_seconds * 2.0, MAX_BACKOFF_SECONDS)
 		_retry_from_server = false
 	_retry_at = _now() + wait
@@ -847,24 +980,26 @@ func track_event(event_name: String, data: Dictionary = {}) -> void:
 		_flush_pending()
 
 ## Send what is queued now instead of waiting for the timer. Cuts a backoff
-## wait short and, after the ingest key was refused, makes one more
-## attempt; a server's Retry-After wait still holds.
+## wait short; a server's Retry-After wait still holds.
 func flush() -> void:
 	_flush_pending(true)
 
 ## --- Public API: status ----------------------------------------------------------
 
 ## Why the SDK is not sending, or "" when nothing is wrong (a session is open
-## or opening normally). One of "disabled" (enabled is false or the player
-## opted out), "invalid_key", "tracking_disabled" (the server kill switch),
-## "offline", "rate_limited", "session_failed", "playtest_job_closed".
-## status_changed fires whenever it changes.
+## or opening normally). One of "no_key" (started with no ingest key),
+## "disabled" (enabled is false, the player opted out, or consent =
+## "opt_in" and no yes yet), "invalid_key", "tracking_disabled" (the server
+## kill switch), "offline", "rate_limited", "session_failed",
+## "playtest_job_closed". status_changed fires whenever it changes.
 func get_status_reason() -> String:
 	return _status_reason
 
 func _update_reason() -> void:
 	var reason := _transient_reason
-	if not enabled or _player_opted_out:
+	if _no_key:
+		reason = "no_key"
+	elif not enabled or _player_opted_out:
 		reason = "disabled"
 	elif _killed:
 		reason = "tracking_disabled"
@@ -877,7 +1012,14 @@ func _update_reason() -> void:
 		status_changed.emit(reason)
 
 func _is_active() -> bool:
-	return enabled and not _player_opted_out and not _killed and not _playtest_blocked
+	return enabled and not _player_opted_out and not _killed and not _playtest_blocked and not _no_key and not _key_refused
+
+## True only while the SDK is collecting: it has a key, and nobody switched
+## it off (enabled, the player, consent = "opt_in" without a yes, the
+## server, or a refused key). Use it to skip work that only feeds
+## analytics. The same answer as is_tracking_enabled().
+func is_enabled() -> bool:
+	return _is_active()
 
 ## --- Public API: switching the SDK on and off ------------------------------------
 
@@ -905,17 +1047,23 @@ func set_enabled(value: bool) -> void:
 ## privacy screen, or a settings toggle, wire it to the two calls below.
 
 ## Turns tracking off or on for this player and remembers the choice across
-## launches (a flag file at OPTOUT_PATH, written at once). Safe to call at
-## any time, even from an earlier autoload or while enabled is false. While
-## off: no session is opened, track_event() drops the event, anything
-## already queued is discarded, and nothing is sent, not even the settings
-## check on the next boot. Turning it back on starts again; game_started is
-## sent at most once per run. A no-op in a playtest run.
+## launches (written at once: the flag file at OPTOUT_PATH, or with consent =
+## "opt_in" the yes at OPTIN_PATH). Safe to call at any time, even from an
+## earlier autoload, while enabled is false or while inert with no key (the
+## choice is saved, nothing starts). While off: no session is opened,
+## track_event() drops the event, anything already queued is discarded, and
+## nothing is sent, not even the settings check on the next boot. Turning
+## it on starts again (with "opt_in", this is the first moment a device id
+## is made); events tracked right after the yes are queued while the
+## settings check runs. Turning it off again keeps the device id; use
+## reset_device_id() to forget it. game_started is sent at most once per
+## run. After a refused key the choice is saved and nothing restarts this
+## run. A no-op in a playtest run.
 func set_tracking_enabled(value: bool) -> void:
 	if not playtest_token.is_empty():
 		print("Ravensight: set_tracking_enabled() ignored in a playtest run")
 		return
-	_write_optout_flag(not value)
+	_save_choice(value)
 	if value != _player_opted_out:
 		# Already as asked.
 		return
@@ -931,6 +1079,8 @@ func set_tracking_enabled(value: bool) -> void:
 		if _is_ready:
 			tracking_disabled.emit("player")
 	else:
+		if _is_ready and not _no_key and not _key_refused:
+			_load_identity()
 		_update_reason()
 		_activate()
 
@@ -946,22 +1096,26 @@ func is_tracking_enabled() -> bool:
 ## new id. Wire this to a "reset my analytics identity" setting if you offer
 ## one. Events already on the server stay under the old id, which nothing
 ## links back to this player. A no-op in a playtest run, whose id is a
-## throwaway that is never saved.
+## throwaway that is never saved, and while inert with no key. With consent
+## = "opt_in" and no yes, it forgets the saved id and makes none, returning
+## "".
 func reset_device_id() -> String:
 	if not playtest_token.is_empty():
 		print("Ravensight: reset_device_id() ignored in a playtest run")
 		return device_id
+	if _no_key:
+		return device_id
+	if _consent_mode() == CONSENT_OPT_IN and _player_opted_out:
+		_remove_file(DEVICE_ID_PATH)
+		device_id = ""
+		_drop_session()
+		_clear_queue()
+		return ""
 	device_id = _generate_device_id()
 	_write_text(DEVICE_ID_PATH, device_id)
 	_drop_session()
 	_clear_queue()
 	return device_id
-
-func _write_optout_flag(opted_out: bool) -> void:
-	if opted_out:
-		_write_text(OPTOUT_PATH, "1")
-	else:
-		_remove_file(OPTOUT_PATH)
 
 ## Ends the current session without touching the queue. Bumping the request
 ## generation makes _on_session_response() ignore any session request still
@@ -997,14 +1151,19 @@ func _on_server_tracking_disabled() -> void:
 	if _quitting:
 		_finish_quit()
 
-## The ingest key was refused. Retrying on a timer cannot fix that, so
-## automatic sending stops for the run; events keep queueing (the cap
-## applies) and an explicit flush() tries once more.
+## The ingest key was refused (revoked, rotated, wrong). Retrying cannot
+## help, so the run ends here: the queue is cleared, nothing more is sent
+## or retried, and a later set_tracking_enabled(true) restarts nothing.
 func _refuse_key() -> void:
+	if _key_refused:
+		return
 	_key_refused = true
+	_drop_session()
+	_clear_queue()
 	_stop_retry()
 	_log_once("invalid_key", INVALID_KEY_MESSAGE, true)
 	_update_reason()
+	tracking_disabled.emit("key")
 	if _quitting:
 		_finish_quit()
 
@@ -1026,26 +1185,33 @@ func _is_fatal_playtest_error(error: String) -> bool:
 ## --- Queue ---------------------------------------------------------------------------
 
 ## Queues the event and announces it on event_tracked with the data actually
-## queued.
+## queued. An event too large to send is dropped and not announced.
 func _enqueue_and_emit(event_name: String, data: Dictionary, timestamp: int = -1, at_front: bool = false) -> void:
-	var queued_data := _enqueue(event_name, data, timestamp, at_front)
-	event_tracked.emit(event_name, queued_data)
+	var queued_data = _enqueue(event_name, data, timestamp, at_front)
+	if queued_data is Dictionary:
+		event_tracked.emit(event_name, queued_data)
 
-## Queues the event and returns the data dictionary actually stored (a
-## tagged copy in a playtest run, the original otherwise).
-func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_front: bool = false) -> Dictionary:
+## Queues the event and returns the data dictionary actually stored (a copy
+## carrying rs_event_id, plus the playtest tags in a playtest run), or null
+## when the data is over MAX_EVENT_BYTES as JSON and the event was dropped.
+func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_front: bool = false):
+	# Never mutate the caller's dictionary.
+	var event_data := data.duplicate()
+	if not playtest_token.is_empty():
+		event_data.merge(_playtest_tags, true)
+	if not device_id.is_empty():
+		event_data["rs_event_id"] = _next_event_id()
+	if _event_bytes(event_data) > MAX_EVENT_BYTES:
+		_log_once("event_too_large", "Ravensight: dropped event \"%s\": larger than %d bytes as JSON (further drops are not logged)" % [event_name, MAX_EVENT_BYTES], true)
+		flush_failed.emit("event_too_large")
+		return null
+
 	while not pending_events.is_empty() and pending_events.size() >= max_queue_size:
 		# Drop the oldest, but keep a queued game_started at the front.
 		if pending_events.size() > 1 and str(pending_events[0].get("event", "")) == "game_started":
 			_remove_queued(1)
 		else:
 			_remove_queued(0)
-
-	var event_data := data
-	if not playtest_token.is_empty():
-		# Never mutate the caller's dictionary: duplicate before tagging.
-		event_data = data.duplicate()
-		event_data.merge(_playtest_tags, true)
 
 	var event := {
 		"event": event_name,
@@ -1061,6 +1227,36 @@ func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_fron
 	if _first_queued_at < 0.0:
 		_first_queued_at = _now()
 	return event_data
+
+## The serialized size of an event's data, as the server measures it.
+func _event_bytes(data: Dictionary) -> int:
+	return JSON.stringify(data).to_utf8_buffer().size()
+
+## The next rs_event_id: the first 16 characters of the device id, the
+## launch time in hex, a per-launch nonce of 8 hex characters and a
+## counter, e.g. "3f1c0a9be2d4c711-6b49d200-9e0c11aa-1". It is kept inside
+## the event's data, so a resend after a failure carries the same id and the
+## server can recognise it.
+func _next_event_id() -> String:
+	if _event_nonce.is_empty():
+		_event_nonce = _random_nonce()
+	_event_counter += 1
+	var prefix := device_id.substr(0, 16)
+	var unsafe := RegEx.new()
+	unsafe.compile("[^A-Za-z0-9_-]")
+	prefix = unsafe.sub(prefix, "_", true)
+	return "%s-%x-%s-%d" % [prefix, _start_unix, _event_nonce, _event_counter]
+
+## Gives every queued event that has none an rs_event_id. Events tracked
+## before this install had a device id (an earlier autoload on the very
+## first launch) get theirs here, before anything is sent.
+func _stamp_event_ids() -> void:
+	if device_id.is_empty():
+		return
+	for e in pending_events:
+		var d = e.get("data")
+		if d is Dictionary and not d.has("rs_event_id"):
+			d["rs_event_id"] = _next_event_id()
 
 func _remove_queued(index: int) -> void:
 	pending_events.remove_at(index)
@@ -1106,10 +1302,9 @@ func _flush_pending(explicit: bool = false) -> void:
 		return
 	if not _can_send_now(explicit):
 		return
-	if _key_refused and not explicit:
-		return
 	_flush_in_progress = true
 	_first_queued_at = -1.0
+	_stamp_event_ids()
 
 	var batch_size: int = mini(MAX_BATCH_SIZE, pending_events.size())
 	if _split_batch_size > 0:
@@ -1137,7 +1332,6 @@ func _on_batch_response(code: int, headers: PackedStringArray, body: PackedByteA
 		_stop_retry()
 		_split_batch_size = 0
 		_reauth_attempts = 0
-		_key_refused = false
 		_transient_reason = ""
 		_update_reason()
 		events_flushed.emit(batch_size)

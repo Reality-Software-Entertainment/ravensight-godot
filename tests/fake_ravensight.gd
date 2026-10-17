@@ -8,9 +8,20 @@ const TEST_STORAGE_DIR := "user://ravensight_tests/"
 var fake_now: float = 1000.0
 var fake_unix: int = 1800000000
 var mobile: bool = false
+## What _random() returns: 0.5 is a jitter factor of exactly 1.0, so the
+## backoff waits are the unspread 10, 20, 40 seconds.
+var fake_random: float = 0.5
 ## Every request: {method, path, headers, body, callback, answered}.
 var requests: Array = []
 var quit_codes: Array = []
+
+func _init() -> void:
+	super()
+	# Tests run with a key unless they pass "ingest_key": "" to make().
+	ingest_key = "gt_live_test"
+
+func _random() -> float:
+	return fake_random
 
 func _now() -> float:
 	return fake_now
