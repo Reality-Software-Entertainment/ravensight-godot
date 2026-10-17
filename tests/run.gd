@@ -914,7 +914,7 @@ func test_distribution_on_session_body() -> void:
 	var body = JSON.parse_string(sdk.requests[1]["body"])
 	eq(sdk.requests[1]["path"], "/session", "second request is the session")
 	eq(body.get("distribution"), "web-itch", "distribution on the session body")
-	for bad in ["x".repeat(41), "line\nbreak", "tab\there"]:
+	for bad in ["x".repeat(41), "line\nbreak", "tab\there", "\U01F3AE".repeat(21)]:
 		_clean_storage()
 		var other := start({"distribution": bad})
 		other.answer_all_ok()

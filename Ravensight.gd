@@ -87,8 +87,8 @@ signal event_tracked(event_name: String, data: Dictionary)
 
 ## A short label of your own for this build, such as "native-release",
 ## "web-itch" or "steam-demo", sent on the session as `distribution`. At
-## most 40 characters, no control characters; anything else is not sent
-## (one warning). Empty sends nothing.
+## most 40 characters (UTF-16 units, as the server counts them), no control
+## characters; anything else is not sent (one warning). Empty sends nothing.
 @export var distribution: String = ""
 
 ## Reported to the server as the client's game version.
@@ -597,7 +597,8 @@ func _validated_distribution() -> String:
 		return ""
 	var control := RegEx.new()
 	control.compile("[\\x00-\\x1f\\x7f]")
-	if label.length() > MAX_DISTRIBUTION_LENGTH or control.search(label) != null:
+	# Counted in UTF-16 units, as the server counts characters.
+	if label.to_utf16_buffer().size() / 2 > MAX_DISTRIBUTION_LENGTH or control.search(label) != null:
 		_log_once("bad_distribution", "Ravensight: distribution must be at most %d characters with no control characters; it is not sent" % MAX_DISTRIBUTION_LENGTH, true)
 		return ""
 	return label

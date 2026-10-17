@@ -328,7 +328,7 @@ bash check-gdscript.sh path/to/godot Ravensight.gd   # the parse check
 
 `tests/run.sh` wraps `godot --headless --script tests/run.gd`, because
 Godot's command line exits 0 even when a script fails to parse. For 0.3.0
-both were run on macOS with Godot v4.8.dev1 (320 checks in 51 tests, all
+both were run on macOS with Godot v4.8.dev1 (322 checks in 51 tests, all
 passing). CI runs both with Godot 4.5-stable on every push
 (`.github/workflows/parse.yml`). The tests replace the network layer; for
 0.2.0 the real `HTTPRequest` path was also run once, by hand, against a

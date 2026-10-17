@@ -45,7 +45,8 @@ changes listed under Breaking. `Ravensight.VERSION` is `"0.3.0"`.
   while the settings check runs. Saying no again keeps the device id;
   `reset_device_id()` forgets it.
 - `distribution` option, sent on `POST /session` when set (at most 40
-  characters, no control characters, otherwise not sent and one warning).
+  characters counted in UTF-16 units, no control characters, otherwise not
+  sent and one warning).
 - `rs_event_id` on every event: the first 16 characters of the device id,
   the launch time in hex, an 8 hex character per-launch nonce from
   `Crypto` and a counter. A resend after a failure carries the same id.
