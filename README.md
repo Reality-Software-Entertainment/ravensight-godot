@@ -66,6 +66,7 @@ It is safe to call from any autoload, even before Ravensight's own
 | `max_queue_size` | `500` | Unsent events kept. The oldest are dropped first; a queued `game_started` is kept. |
 | `flush_interval` | `5.0` | Seconds an event waits so it can go out with others. 50 waiting events go at once. |
 | `handle_quit` | `true` | Take over the window close (and the Android back button when it quits) to send the last events, holding the quit at most 1.5 seconds. See Quitting. |
+| `performance` | `false` | Opt in to one `health` event per session with frame rate, memory and boot time. See Typed events. |
 | `session_timeout` | `1800.0` | Android and iOS only: seconds in the background after which the session counts as over. See Automatic events. |
 
 ## Functions
@@ -85,6 +86,10 @@ It is safe to call from any autoload, even before Ravensight's own
 | `api_base()` | The API root requests go to, e.g. `https://api.ravensight.io/api/v1`. |
 | `is_playtest()` | `true` in a run driven by the Ravensight playtest runner. |
 | `set_playtest_context(ctx)` | Puts a running game into playtest mode. The SDK already does this from the playtest runner's variables, so a game never needs to call it by hand. |
+| `track_purchase(item_type, item_id, amount, currency, options = {})` | Queue a real-money purchase. `amount` is whole minor units. See Typed events. |
+| `track_resource(flow, resource, amount, options = {})` | Queue a resource gained (`source`) or spent (`sink`). |
+| `track_progression(status, p1, options = {})` | Queue a progression step: `start`, `complete` or `fail`. |
+| `track_error(severity, message, options = {})` | Queue an error: `debug`, `info`, `warning`, `error` or `critical`. |
 | `fetch_suggestions()` | Experimental. Answers on `suggestions_received`; while tracking is off nothing is requested and it answers with an empty list. |
 
 `Ravensight.session_token` is the open session's token, or `""` until one
@@ -260,6 +265,55 @@ Ravensight.track_event("run_over", {"level": "castle", "rs_kind": "death"})
 
 Keys that start with `rs_` are reserved for Ravensight. The SDK sets
 `rs_event_id` itself.
+
+## Typed events
+
+Four helpers send events Ravensight understands without any naming rules.
+Each one only builds the reserved `rs_*` properties and calls
+`track_event()`, so queueing, batching, retries and the player's opt-out
+work exactly as before. Every helper takes an optional `options` dictionary:
+`data` adds your own properties (the reserved keys win if they clash) and
+`event_name` replaces the default event name.
+
+```gdscript
+# Money is whole minor units: 499 is 4.99 USD. The currency is upper-cased.
+Ravensight.track_purchase("iap", "gem_pack_small", 499, "usd",
+		{"cart": "summer_sale", "transaction_id": "T-1001"})
+
+# A resource gained or spent. Default names: resource_source, resource_sink.
+Ravensight.track_resource("source", "gold", 25)
+Ravensight.track_resource("sink", "gold", 10, {"item_type": "weapon", "item_id": "sword"})
+
+# Progression nodes. Default names: progression_start, _complete, _fail.
+Ravensight.track_progression("start", "world1", {"p2": "level3"})
+Ravensight.track_progression("complete", "world1", {"p2": "level3", "p3": "boss", "score": 1200})
+
+# Errors. The message is cut to 200 characters and the stack to 2000.
+Ravensight.track_error("critical", "save file corrupt", {"stack": str(get_stack())})
+```
+
+The helpers never throw and do not check your values beyond passing them
+on. A wrong amount or an unknown status becomes an event the server flags,
+which shows on the Implementation health card in the dashboard.
+
+| Option | Used by | Becomes |
+| --- | --- | --- |
+| `cart`, `transaction_id` | `track_purchase` | `rs_cart`, `rs_transaction_id` |
+| `item_type`, `item_id` | `track_resource` | `rs_item_type`, `rs_item_id` |
+| `p2`, `p3`, `score` | `track_progression` | `rs_p2`, `rs_p3`, `rs_score` |
+| `stack` | `track_error` | `rs_stack` |
+| `data`, `event_name` | all | extra properties, event name |
+
+### Performance health
+
+Set `performance = true` (in the inspector, or on the autoload before it is
+ready) to opt in. The SDK then samples the frame time once per second, keeps
+at most 600 samples, and sends exactly one `health` event per session with
+`rs_fps_median`, `rs_fps_p10`, and `rs_memory_mb` and `rs_boot_ms` where the
+platform provides them. It goes out when the app is backgrounded (Android
+and iOS), when the page is hidden (web) or when the game quits (desktop).
+With no sample taken nothing is sent, and sampling never sends anything
+itself. It is off by default.
 
 ## Player privacy
 

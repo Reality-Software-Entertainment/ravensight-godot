@@ -52,6 +52,26 @@ changes listed under Breaking. `Ravensight.VERSION` is `"0.3.0"`.
   `Crypto` and a counter. A resend after a failure carries the same id.
 - `is_enabled()`, true only while the SDK is collecting.
 
+### Typed events and performance sampling (included in this release)
+
+`Ravensight.VERSION` is `"0.3.0"`.
+
+### Added
+
+- Typed event helpers: `track_purchase()`, `track_resource()`,
+  `track_progression()` and `track_error()`. Each builds the reserved `rs_*`
+  properties and calls `track_event()`, so queueing, batching, retries and
+  opt-out are unchanged. Extra properties go in `options["data"]` (the
+  reserved keys win), and `options["event_name"]` overrides the default
+  event name.
+- Opt-in performance sampling: set `performance = true` to sample the frame
+  time once per second and send one `health` event per session (median and
+  10th percentile frames per second, memory where the platform exposes it,
+  boot time) when the app goes to the background (mobile), the page is
+  hidden (web) or the game quits (desktop). Nothing is sent when no sample
+  was taken, and nothing is sent from the frame hook.
+- The session request now carries `"sdk": "godot/0.3.0"`.
+
 ## [0.2.0] - 2026-10-10
 
 The first versioned release. `Ravensight.VERSION` is `"0.2.0"`.

@@ -11,6 +11,9 @@ var mobile: bool = false
 ## What _random() returns: 0.5 is a jitter factor of exactly 1.0, so the
 ## backoff waits are the unspread 10, 20, 40 seconds.
 var fake_random: float = 0.5
+var web: bool = false
+var memory: float = 128.0
+var ticks: int = 2500
 ## Every request: {method, path, headers, body, callback, answered}.
 var requests: Array = []
 var quit_codes: Array = []
@@ -34,6 +37,15 @@ func _storage_dir() -> String:
 
 func _is_mobile() -> bool:
 	return mobile
+
+func _is_web() -> bool:
+	return web
+
+func _memory_mb() -> float:
+	return memory
+
+func _ticks_msec() -> int:
+	return ticks
 
 func _quit_tree(exit_code: int) -> void:
 	quit_codes.append(exit_code)
