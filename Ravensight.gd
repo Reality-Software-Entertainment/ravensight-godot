@@ -86,7 +86,7 @@ signal event_tracked(event_name: String, data: Dictionary)
 @export var consent: String = "opt_out"
 
 ## A short label of your own for this build, such as "native-release",
-## "web-itch" or "steam-demo", sent on the session as `distribution`. At
+## "web-itch" or "native-demo", sent on the session as `distribution`. At
 ## most 40 characters (UTF-16 units, as the server counts them), no control
 ## characters; anything else is not sent (one warning). Empty sends nothing.
 @export var distribution: String = ""

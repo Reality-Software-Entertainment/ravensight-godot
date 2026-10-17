@@ -60,7 +60,7 @@ It is safe to call from any autoload, even before Ravensight's own
 | `ingest_key` | `""` | Your game's publishable `gt_live_` key, or a public `gt_pub_` key. Empty falls back to the project setting `ravensight/ingest_key`; empty there too, the SDK is inert for the run. |
 | `optional` | `false` | `true` silences the one warning an inert start (no key) prints. |
 | `consent` | `"opt_out"` | `"opt_in"` sends nothing, and makes no device id, until `set_tracking_enabled(true)`. See Public builds. |
-| `distribution` | `""` | A short label for this build, such as `"steam-demo"` or `"web-itch"`, sent on the session. At most 40 characters, no control characters, otherwise not sent. |
+| `distribution` | `""` | A short label for this build, such as `"native-demo"` or `"web-itch"`, sent on the session. At most 40 characters, no control characters, otherwise not sent. |
 | `game_version` | `1.0.0` | Sent with every session. |
 | `enabled` | `true` | `false` turns the SDK off for this run: no request of any kind, nothing queued, no `game_started`, until `set_enabled(true)`. Never saved. `set_tracking_enabled()` still saves the player's choice while it is `false`. |
 | `max_queue_size` | `500` | Unsent events kept. The oldest are dropped first; a queued `game_started` is kept. |
@@ -218,7 +218,7 @@ key and none of these options.
   device id; to forget it too, call `reset_device_id()`. Set `consent`
   with the other options, before Ravensight's `_ready()`.
 - **`distribution`** is a short label of your own, such as
-  `"steam-release"`, `"itch-demo"` or `"web-itch"`, sent on the session so
+  `"native-release"`, `"itch-demo"` or `"web-itch"`, sent on the session so
   you can tell builds apart. It is not sent when unset.
 - **`rs_event_id`** is added to every event's data: the first 16
   characters of the device id, the launch time in hex, a random 8 hex
