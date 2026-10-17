@@ -22,6 +22,9 @@ func _run() -> void:
 	# The tree is live once the first frame starts.
 	await process_frame
 	var tests := [
+		"test_config_cache_and_exposure",
+		"test_config_scope_and_consent",
+		"test_config_invalid_and_stale",
 		"test_api_base_forms",
 		"test_disabled_start_makes_no_requests",
 		"test_set_enabled_true_starts_once",
@@ -202,7 +205,7 @@ func test_api_base_forms() -> void:
 	eq(fresh.api_url, "https://api.ravensight.io", "default api_url is the bare host")
 	eq(Fake.REQUEST_TIMEOUT_SECONDS, 15.0, "request timeout")
 	eq(fresh.max_queue_size, 500, "default queue cap")
-	eq(Fake.VERSION, "0.3.0", "version constant")
+	eq(Fake.VERSION, "0.3.1", "version constant")
 	var plain: Node = load("res://Ravensight.gd").new()
 	eq(plain.ingest_key, "", "default ingest_key is empty")
 	eq(plain.consent, "opt_out", "default consent")
@@ -304,7 +307,7 @@ func test_pre_ready_track_waits_for_ready() -> void:
 	check(int(sdk.pending_events[0]["timestamp"]) <= int(sdk.pending_events[1]["timestamp"]), "game_started carries the start time")
 	eq(sdk.paths(), ["/settings"], "only the settings check before its answer")
 	sdk.answer_all_ok()
-	eq(sdk.paths(), ["/settings", "/session", "/track/batch"], "then session and one batch")
+	eq(sdk.paths(), ["/settings", "/session", "/track/batch", "/ingest/config"], "then session and one batch")
 	eq(sdk.event_names(sdk.requests[2]), ["game_started", "early"], "batch contents")
 
 func test_suggestions_and_feedback_while_disabled() -> void:
@@ -502,10 +505,12 @@ func test_batch_401_reopens_twice_then_backs_off() -> void:
 	sdk.answer(401, {"error": "invalid_session"})
 	sdk.answer(201, {"token": "t2", "expiresIn": 86400})
 	sdk.answer(401, {"error": "invalid_session"})
+	sdk.answer(304, "") # The config request from t2.
 	sdk.answer(201, {"token": "t3", "expiresIn": 86400})
 	sdk.answer(401, {"error": "invalid_session"})
-	var tail: Array = sdk.paths().slice(3)
-	eq(tail, ["/track/batch", "/session", "/track/batch", "/session", "/track/batch"], "two reopens, then stop")
+	sdk.answer(304, "") # The config request from t3.
+	var tail: Array = sdk.paths().slice(4)
+	eq(tail, ["/track/batch", "/session", "/track/batch", "/ingest/config", "/session", "/track/batch", "/ingest/config"], "two reopens, then stop")
 	eq(sdk.unanswered().size(), 0, "no third reopen at once")
 	sdk.advance(10.0)
 	eq(sdk.unanswered().size(), 1, "the backoff takes over")
@@ -604,7 +609,7 @@ func test_reset_device_id() -> void:
 	sdk.track_event("y")
 	sdk.flush()
 	sdk.answer_all_ok()
-	var session_body = JSON.parse_string(sdk.requests[sdk.requests.size() - 2]["body"])
+	var session_body = JSON.parse_string(sdk.requests.filter(func(r): return r["path"] == "/session").back()["body"])
 	eq(session_body["deviceId"], fresh, "the next session uses the new id")
 
 	# An existing saved id is kept as it is.
@@ -888,7 +893,7 @@ func test_opt_in_after_yes_starts_and_queues() -> void:
 	sdk.track_event("right_after_yes")
 	eq(queued_names(sdk), ["game_started", "right_after_yes"], "events right after the yes are queued while the check runs")
 	sdk.answer_all_ok()
-	eq(sdk.paths(), ["/settings", "/session", "/track/batch"], "then session and batch")
+	eq(sdk.paths(), ["/settings", "/session", "/track/batch", "/ingest/config"], "then session and batch")
 	var names := _sent_events(sdk).map(func(e): return e["event"])
 	eq(names, ["game_started", "right_after_yes"], "the event before the yes was never sent")
 	eq(sdk.is_enabled(), true, "is_enabled() true")
@@ -1070,7 +1075,7 @@ func test_default_key_only_unchanged() -> void:
 	var files := _storage_files()
 	files.sort()
 	eq(files, ["device_id.save"], "only the device id file, as in 0.2.0")
-	eq(sdk.paths(), ["/settings", "/session", "/track/batch"], "settings, session, batch")
+	eq(sdk.paths(), ["/settings", "/session", "/track/batch", "/ingest/config"], "settings, session, batch")
 	var body = JSON.parse_string(sdk.requests[1]["body"])
 	eq(body.keys().size(), 4, "the session body includes the SDK version")
 # --- typed events and health --------------------------------------------------
@@ -1089,7 +1094,7 @@ func test_session_request_carries_sdk() -> void:
 	var sdk := start()
 	sdk.answer(200, {"trackingEnabled": true})
 	var body = JSON.parse_string(sdk.requests[1]["body"])
-	eq(body["sdk"], "godot/0.3.0", "sdk name and version on session create")
+	eq(body["sdk"], "godot/0.3.1", "sdk name and version on session create")
 
 func test_track_purchase_properties() -> void:
 	var sdk := start()
@@ -1283,3 +1288,79 @@ func test_health_no_samples_sends_nothing() -> void:
 	eq(sent_count(sdk, "health") + queued_names(sdk).count("health"), 0, "no samples, no health event")
 	var names := sdk.event_names(sdk.unanswered()[0]) if sdk.unanswered().size() > 0 else []
 	check(not names.has("health"), "not in the final flush either")
+
+func _config_doc() -> Dictionary:
+	return {"values": {"speed": 3, "hints": false, "rules": {"bonus": 2}}, "experiments": [{"key": "difficulty", "variant": "easy"}], "etag": '"' + "a".repeat(64) + '"'}
+
+func test_config_cache_and_exposure() -> void:
+	var sdk := started_with_session()
+	var ready: Array = []
+	sdk.config_ready.connect(func(source): ready.append(source))
+	sdk.fetch_config()
+	var req: Dictionary = sdk.unanswered()[0]
+	check(req["path"].begins_with("/ingest/config?deviceId="), "existing config endpoint")
+	eq(sdk.header(req, "X-API-Key"), sdk.ingest_key, "existing ingest key")
+	sdk.fetch_config()
+	eq(sdk.unanswered().size(), 1, "concurrent calls deduplicate")
+	sdk.answer(200, _config_doc())
+	eq(ready, ["network"], "ready signal")
+	eq(sdk.get_config("speed", 0), 3, "integer getter accepts whole JSON number")
+	eq(sdk.get_config("speed", 0.0), 3.0, "float getter")
+	eq(sdk.get_config("hints", true), false, "boolean getter")
+	eq(sdk.get_config("speed", "fallback"), "fallback", "no coercion")
+	var rules: Dictionary = sdk.get_config("rules", {})
+	rules["bonus"] = 99
+	eq(sdk.get_config("rules", {})["bonus"], 2.0, "copy isolation")
+	sdk.track_event("level", {"rs_exp_difficulty": "forged"})
+	eq(sdk.pending_events.back()["data"]["rs_exp_difficulty"], "easy", "assignment overrides caller")
+	sdk.fetch_config()
+	eq(sdk.header(sdk.unanswered()[0], "If-None-Match"), _config_doc()["etag"], "ETag reused")
+	sdk.answer(304, "")
+	eq(ready.back(), "cache", "304 cache")
+	sdk.fetch_config()
+	sdk.answer(0, "")
+	eq(sdk.get_config("speed", 0), 3, "offline fallback")
+	var empty := _config_doc()
+	empty["values"] = {}
+	empty["experiments"] = []
+	sdk.fetch_config()
+	sdk.answer(200, empty)
+	sdk.track_event("after")
+	check(not sdk.pending_events.back()["data"].has("rs_exp_difficulty"), "stopped experiment cleared")
+	eq(sdk.get_config("speed", 0), 0, "removed value cleared")
+
+func test_config_scope_and_consent() -> void:
+	var sdk := started_with_session()
+	sdk.fetch_config()
+	sdk.answer(200, _config_doc())
+	var restored := make()
+	root.add_child(restored)
+	eq(restored.get_config("speed", 0), 3, "persistent cache restored")
+	restored.game_version = "different"
+	eq(restored.get_config("speed", 0), 0, "different build isolated")
+	restored.game_version = sdk.game_version
+	restored.ingest_key = "other"
+	eq(restored.get_config("speed", 0), 0, "different key isolated")
+	sdk.reset_device_id()
+	eq(sdk.get_config("speed", 0), 0, "reset identity isolated")
+	sdk.set_tracking_enabled(false)
+	var before := sdk.requests.size()
+	sdk.fetch_config()
+	eq(sdk.requests.size(), before, "no request without consent")
+
+func test_config_invalid_and_stale() -> void:
+	var sdk := started_with_session()
+	sdk.fetch_config()
+	sdk.answer(200, _config_doc())
+	var invalid := _config_doc()
+	invalid["experiments"][0]["variant"] = "invalid value"
+	sdk.fetch_config()
+	sdk.answer(200, invalid)
+	eq(sdk.get_config("speed", 0), 3, "malformed response keeps cache")
+	var stale: Array = []
+	sdk.config_ready.connect(func(source): stale.append(source))
+	sdk.fetch_config()
+	sdk.reset_device_id()
+	sdk.answer(200, _config_doc())
+	eq(sdk.get_config("speed", 0), 0, "late old identity discarded")
+	eq(stale.size(), 0, "no readiness for stale response")

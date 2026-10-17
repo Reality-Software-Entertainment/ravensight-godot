@@ -14,11 +14,13 @@
 extends Node
 
 ## The SDK version. Bumped with every tagged release.
-const VERSION := "0.3.0"
+const VERSION := "0.3.1"
 
 ## --- Signals -------------------------------------------------------------
 
 ## Emitted once a session token has been issued and is ready to use.
+signal config_ready(source: String)
+
 signal session_ready
 ## Emitted when opening a session fails. `reason` is "invalid_key" when the
 ## ingest key was refused, otherwise the server's error code (or "offline").
@@ -159,6 +161,12 @@ const INVALID_KEY_MESSAGE := "Ravensight: ingest key refused (invalid_key), send
 ## --- State -------------------------------------------------------------------
 
 var device_id: String = ""
+var _config_document: Dictionary = {}
+var _config_scope: String = ""
+var _config_pending: bool = false
+var _config_generation: int = 0
+const CONFIG_PATH := "user://ravensight_config.json"
+
 
 ## The open session's token, or "" until one opens. Read it if your game
 ## server should join the same session (send it as `joinToken`, see the
@@ -945,6 +953,7 @@ func _on_session_response(code: int, headers: PackedStringArray, body: PackedByt
 			print("Ravensight: session ready")
 			session_ready.emit()
 			_flush_pending()
+			fetch_config()
 		else:
 			push_error("Ravensight: malformed session response")
 			_transient_reason = "session_failed"
@@ -1025,6 +1034,112 @@ func track_event(event_name: String, data: Dictionary = {}) -> void:
 		return
 	if pending_events.size() >= MAX_BATCH_SIZE:
 		_flush_pending()
+
+## Config is public game data, never secrets. Invalid/offline responses keep
+## the last valid cache for this exact endpoint, key, player and build.
+func _current_config_scope() -> String:
+	return JSON.stringify([api_base(), ingest_key, device_id, _config_platform(), game_version]).sha256_text()
+
+func _config_platform() -> String:
+	return OS.get_name() if playtest_token.is_empty() else "ravensight-playtest"
+
+func _config_matches(pattern: String, value: Variant) -> bool:
+	if not value is String:
+		return false
+	var regex := RegEx.new()
+	regex.compile(pattern)
+	return regex.search(value) != null
+
+func _config_json_safe(value: Variant, depth: int = 0) -> bool:
+	if depth > 20:
+		return false
+	if value is Dictionary:
+		for key in value:
+			if not key is String or key in ["__proto__", "prototype", "constructor"] or not _config_json_safe(value[key], depth + 1):
+				return false
+	elif value is Array:
+		for child in value:
+			if not _config_json_safe(child, depth + 1):
+				return false
+	elif value is float:
+		return is_finite(value)
+	elif not (value == null or value is String or value is bool or value is int):
+		return false
+	return true
+
+func _valid_config(value: Variant) -> bool:
+	if not value is Dictionary or not value.get("values") is Dictionary or not value.get("experiments") is Array:
+		return false
+	if value["values"].size() > 50 or value["experiments"].size() > 10 or not _config_matches('^"[a-f0-9]{64}"$', value.get("etag")):
+		return false
+	for key in value["values"]:
+		if not _config_matches("^[a-z][a-z0-9_]{0,63}$", key) or not _config_json_safe(value["values"][key]) or JSON.stringify(value["values"][key]).to_utf8_buffer().size() > 8192:
+			return false
+	var seen := {}
+	for row in value["experiments"]:
+		if not row is Dictionary or not _config_matches("^[a-z][a-z0-9_]{0,63}$", row.get("key")) or not _config_matches("^[a-z][a-z0-9_-]{0,39}$", row.get("variant")) or seen.has(row["key"]):
+			return false
+		seen[row["key"]] = true
+	return true
+
+func _cached_config() -> Dictionary:
+	if not _is_active() or ingest_key.strip_edges().is_empty() or device_id.is_empty():
+		return {}
+	var scope := _current_config_scope()
+	if _config_scope == scope:
+		return _config_document
+	_config_scope = scope
+	_config_document = {}
+	if playtest_token.is_empty():
+		var text := _read_text(CONFIG_PATH)
+		var cached = JSON.parse_string(text) if not text.is_empty() else null
+		if cached is Dictionary and cached.get("scope") == scope and _valid_config(cached.get("document")):
+			_config_document = cached["document"]
+	return _config_document
+
+## No type coercion, except JSON numbers support both int and float defaults.
+## Integer defaults accept only whole numbers within the exact JSON range.
+func get_config(key: String, fallback: Variant) -> Variant:
+	var values: Dictionary = _cached_config().get("values", {})
+	if not values.has(key):
+		return fallback
+	var value: Variant = values[key]
+	if fallback is int and (value is float or value is int):
+		return int(value) if is_finite(float(value)) and float(value) == floor(float(value)) and abs(float(value)) <= 9007199254740991.0 else fallback
+	if fallback is float and (value is float or value is int):
+		return float(value)
+	if typeof(value) != typeof(fallback):
+		return fallback
+	return value.duplicate(true) if value is Dictionary or value is Array else value
+
+func fetch_config() -> void:
+	if not _is_active() or ingest_key.strip_edges().is_empty() or _quitting or device_id.is_empty() or _config_pending:
+		return
+	var cached := _cached_config()
+	var headers := _key_headers()
+	if cached.has("etag"):
+		headers.append("If-None-Match: " + cached["etag"])
+	_config_pending = true
+	_config_generation += 1
+	var path := "/ingest/config?deviceId=" + device_id.uri_encode() + "&platform=" + _config_platform().uri_encode() + "&gameVersion=" + game_version.uri_encode()
+	_send("GET", path, headers, "", _on_config_response.bind(_config_generation, _current_config_scope()))
+
+func _on_config_response(code: int, _headers: PackedStringArray, body: PackedByteArray, generation: int, scope: String) -> void:
+	if generation != _config_generation:
+		return
+	_config_pending = false
+	if not _is_active() or scope != _current_config_scope():
+		return
+	var source := "cache" if not _cached_config().is_empty() else "default"
+	if code == 200 and body.size() <= 430000:
+		var parsed = _parse_json(body)
+		if _valid_config(parsed):
+			_config_document = parsed
+			_config_scope = scope
+			source = "network"
+			if playtest_token.is_empty():
+				_write_text(CONFIG_PATH, JSON.stringify({"scope": scope, "document": parsed}))
+	config_ready.emit(source)
 
 ## --- Typed events ---------------------------------------------------------------
 ##
@@ -1295,6 +1410,10 @@ func _drop_session() -> void:
 	session_expires_at = 0
 	_session_request_pending = false
 	_session_request_generation += 1
+	_config_generation += 1
+	_config_pending = false
+	_config_document = {}
+	_config_scope = ""
 
 ## Discards every queued event. Bumping _queue_generation makes the response
 ## to any batch still in flight a no-op (see _on_batch_response()), and the
@@ -1367,6 +1486,8 @@ func _enqueue_and_emit(event_name: String, data: Dictionary, timestamp: int = -1
 func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_front: bool = false):
 	# Never mutate the caller's dictionary.
 	var event_data := data.duplicate()
+	for assignment in _cached_config().get("experiments", []):
+		event_data["rs_exp_" + assignment["key"]] = assignment["variant"]
 	if not playtest_token.is_empty():
 		event_data.merge(_playtest_tags, true)
 	if not device_id.is_empty():

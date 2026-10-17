@@ -396,3 +396,30 @@ https://ravensight.io/docs/#godot-sdk
 ## License
 
 MIT
+
+## Remote configuration and experiments
+
+Held release: the platform config endpoint must be deployed first. Config is
+public game data, never a place for secrets. A successful session starts an
+asynchronous config fetch using the existing ingest key.
+
+```gdscript
+Ravensight.config_ready.connect(func(source):
+    var speed: float = Ravensight.get_config("movement_speed", 4.0)
+    print("Config source: ", source, ", speed: ", speed))
+Ravensight.fetch_config() # Explicit refresh with the cached ETag.
+```
+
+The readiness source is `network`, `cache` or `default`. Requests share an
+in-flight fetch and use the SDK's bounded HTTP timeout. Network failures and
+invalid documents preserve the last valid cache. A single persistent cache is
+scoped to endpoint, key, device, platform and build. Playtests never persist it.
+Opt-out and identity changes discard late responses. Getters use your fallback
+for missing keys or a different type; JSON numbers accept float defaults and
+whole numbers accept integer defaults. Arrays and dictionaries are copied.
+
+Events tracked after a config is available automatically carry active
+`rs_exp_<key>` labels, including typed helpers. Already queued events keep their
+original labels. Refresh to pick up stopped experiments. A fresh config response
+uses one ordinary event; an unchanged ETag response is free. Keep safe defaults
+in the game for its first launch and offline play.

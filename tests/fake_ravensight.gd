@@ -105,7 +105,7 @@ func answer_all_ok(limit: int = 100) -> void:
 				answer(200, {"suggestions": []})
 
 func paths() -> Array:
-	return requests.map(func(r): return r["path"])
+	return requests.map(func(r): return str(r["path"]).split("?")[0])
 
 func header(req: Dictionary, name: String) -> String:
 	for h in req["headers"]:

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1 (held)
+
+### Added
+
+- Session-start remote config, ETag and scoped offline cache, typed fallback getters and config_ready.
+- Active experiment exposure labels on tracked events.
+
+### Fixed
+
+- Discard late config responses after identity or consent changes.
+
+
 ## [0.3.0] - 2026-10-16
 
 For games whose builds or source anyone can download. A game that sets a
