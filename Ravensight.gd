@@ -1073,7 +1073,7 @@ func _valid_config(value: Variant) -> bool:
 	if value["values"].size() > 50 or value["experiments"].size() > 10 or not _config_matches('^"[a-f0-9]{64}"$', value.get("etag")):
 		return false
 	for key in value["values"]:
-		if not _config_matches("^[a-z][a-z0-9_]{0,63}$", key) or not _config_json_safe(value["values"][key]) or JSON.stringify(value["values"][key]).to_utf8_buffer().size() > 8192:
+		if not _config_matches("^[a-z][a-z0-9_]{0,63}$", key) or key in ["constructor", "prototype"] or not _config_json_safe(value["values"][key]) or JSON.stringify(value["values"][key]).to_utf8_buffer().size() > 8192:
 			return false
 	var seen := {}
 	for row in value["experiments"]:

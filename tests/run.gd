@@ -1350,6 +1350,15 @@ func test_config_scope_and_consent() -> void:
 
 func test_config_invalid_and_stale() -> void:
 	var sdk := started_with_session()
+	for word in ["constructor", "prototype"]:
+		var candidate := _config_doc()
+		candidate["values"] = {word: 1}
+		eq(sdk._valid_config(candidate), false, "reserved config key rejected")
+		candidate["values"] = {"nested": {word: 1}}
+		eq(sdk._valid_config(candidate), false, "reserved nested key rejected")
+		candidate["values"] = {}
+		candidate["experiments"] = [{"key": word, "variant": word}]
+		eq(sdk._valid_config(candidate), true, "experiment label is a safe string value")
 	sdk.fetch_config()
 	sdk.answer(200, _config_doc())
 	var invalid := _config_doc()

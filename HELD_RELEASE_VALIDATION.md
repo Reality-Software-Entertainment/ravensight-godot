@@ -16,3 +16,8 @@ owner approval. Older README test counts describe their earlier branch runs;
 this file records the combined candidate.
 
 Remote config wave: Godot headless behavior suite passed (see local godot-config-full.log), including scoped cache, strict getters, ETags, labels, consent and stale identity responses. Parse check passed. Version 0.3.1 remains held, not pushed or tagged.
+
+Config identifier compatibility audit: 434 checks in 69 headless Godot tests passed. Tests require access to their user-data fixtures.
+Config property keys reject constructor/prototype, including nested JSON properties.
+Experiment keys and variant labels may use those words as string values, matching
+the server contract. Regression coverage distinguishes those cases. Publishing remains held.
