@@ -21,3 +21,5 @@ Config identifier compatibility audit: 434 checks in 69 headless Godot tests pas
 Config property keys reject constructor/prototype, including nested JSON properties.
 Experiment keys and variant labels may use those words as string values, matching
 the server contract. Regression coverage distinguishes those cases. Publishing remains held.
+
+Screenshot Player Reports: 444 checks in 71 headless tests passed; all three GDScripts parse successfully. Includes upload/finalize, failure retry identity, credential-free multipart and stale-session rejection. No live storage provider or physical-device screenshot run was performed. Existing held 0.3.1 candidate now includes this feature; no tag, push or publication occurred.

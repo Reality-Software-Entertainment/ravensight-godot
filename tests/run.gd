@@ -22,6 +22,8 @@ func _run() -> void:
 	# The tree is live once the first frame starts.
 	await process_frame
 	var tests := [
+		"test_report_screenshot_retry",
+		"test_report_rejects_unsafe_storage",
 		"test_config_cache_and_exposure",
 		"test_config_scope_and_consent",
 		"test_config_invalid_and_stale",
@@ -1373,3 +1375,45 @@ func test_config_invalid_and_stale() -> void:
 	sdk.answer(200, _config_doc())
 	eq(sdk.get_config("speed", 0), 0, "late old identity discarded")
 	eq(stale.size(), 0, "no readiness for stale response")
+
+func test_report_screenshot_retry() -> void:
+	var sdk := started_with_session()
+	var reports = load("res://RavensightReports.gd").new()
+	sdk.add_child(reports)
+	var submitted: Array = []
+	reports.report_submitted.connect(func(id): submitted.append(id))
+	var image := Image.create(2, 2, false, Image.FORMAT_RGB8)
+	reports.submit_report("Broken door", image)
+	var original: String = sdk.unanswered()[0].body
+	var payload = JSON.parse_string(original)
+	check(payload.image and payload.bytes > 0 and payload.sha256.length() == 64, "image metadata before reservation")
+	sdk.answer(201, {"id": "submission", "status": "pending"})
+	sdk.answer(200, {"url": "https://storage.example/upload", "fields": {"key": "image", "policy": "signed"}})
+	var upload: Dictionary = sdk.unanswered()[0]
+	eq(upload.headers.size(), 1, "storage only has multipart content type")
+	check(upload.body is PackedByteArray, "storage uses binary multipart")
+	sdk.answer(503, {})
+	reports.retry_report()
+	eq(sdk.unanswered()[0].body, original, "retry preserves client ID timestamp hash and body")
+	sdk.answer(201, {"id": "submission", "status": "pending"})
+	sdk.answer(200, {"url": "https://storage.example/upload", "fields": {"key": "image"}})
+	sdk.answer(204, {})
+	eq(sdk.unanswered()[0].path, "/reports/submission/finalize", "successful upload is finalized")
+	sdk.answer(200, {"status": "complete", "reportId": "report"})
+	eq(submitted, ["report"], "deduplicated complete receipt emitted")
+
+func test_report_rejects_unsafe_storage() -> void:
+	var sdk := started_with_session()
+	var reports = load("res://RavensightReports.gd").new()
+	sdk.add_child(reports)
+	var failures: Array = []
+	reports.report_failed.connect(func(reason): failures.append(reason))
+	reports.submit_report("Broken door", Image.create(2, 2, false, Image.FORMAT_RGB8))
+	sdk.answer(201, {"id": "submission", "status": "pending"})
+	sdk.answer(200, {"url": "http://storage.example/upload", "fields": {"key": "image"}})
+	eq(sdk.unanswered().size(), 0, "insecure storage rejected without text fallback")
+	eq(failures.size(), 1, "upload failure surfaced")
+	sdk.session_token = "changed"
+	reports.retry_report()
+	eq(sdk.unanswered().size(), 0, "retry cannot rebind to another session")
+	eq(failures.size(), 2, "scope change surfaced")

@@ -54,7 +54,7 @@ func _process(_delta: float) -> void:
 	# Timers run only when a test calls advance().
 	pass
 
-func _send(method: String, path: String, headers: Array, body: String, callback: Callable) -> void:
+func _send(method: String, path: String, headers: Array, body: Variant, callback: Callable) -> void:
 	requests.append({
 		"method": method,
 		"path": path,

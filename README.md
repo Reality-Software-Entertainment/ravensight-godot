@@ -423,3 +423,30 @@ Events tracked after a config is available automatically carry active
 original labels. Refresh to pick up stopped experiments. A fresh config response
 uses one ordinary event; an unchanged ETag response is free. Keep safe defaults
 in the game for its first launch and offline play.
+
+
+## Screenshot Player Reports
+
+Add `RavensightReports.gd` as a child of the Ravensight autoload. Optional
+`RavensightReportOverlay.gd` supplies a capture/redaction UI; configure its
+transport path and input action. Direct use:
+
+```gdscript
+$Ravensight/Reports.report_submitted.connect(func(id): print(id))
+$Ravensight/Reports.report_failed.connect(func(reason): print(reason))
+$Ravensight/Reports.submit_report("The door is stuck", screenshot_image)
+# On an uncertain result, retry this helper without calling submit_report again:
+$Ravensight/Reports.retry_report()
+```
+
+Images are copied, resized to at most 1600 pixels on the longest edge and encoded
+as JPEG below 1,000,000 bytes. Redact private content before submission. The
+server also validates and sanitizes images. Uploads use a presigned HTTPS form;
+no SDK key or session token is sent to storage. The helper polls finalization for
+up to 70 seconds; a timeout is pending, not success. Retry retains the client ID,
+capture time, hash and session. Identity changes or revoked consent stop retries
+instead of creating another paid report. Retry state is memory-only; keep the
+helper alive. Starting a new submission is a new operation. Text-only fallback
+requires the explicit `send_text_only()` action and cancellation of an existing
+incomplete upload. Screenshot reports reserve 20,001 weighted events; text-only
+reports use 1. Unfinished reservations expire server-side. Never auto-fallback.

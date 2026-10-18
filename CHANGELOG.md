@@ -4,6 +4,8 @@
 
 ### Added
 
+- Screenshot Player Reports with session-bound retry identity and credential-free presigned multipart uploads.
+
 - Session-start remote config, ETag and scoped offline cache, typed fallback getters and config_ready.
 - Active experiment exposure labels on tracked events.
 

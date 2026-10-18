@@ -726,7 +726,7 @@ func _random_nonce() -> String:
 ## Every request the SDK makes goes through here. `path` is relative to
 ## api_base(); `callback` is called with (status, headers, body), where
 ## status is 0 for a network failure or a timeout.
-func _send(method: String, path: String, headers: Array, body: String, callback: Callable) -> void:
+func _send(method: String, path: String, headers: Array, body: Variant, callback: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = REQUEST_TIMEOUT_SECONDS
 	add_child(http)
@@ -734,8 +734,14 @@ func _send(method: String, path: String, headers: Array, body: String, callback:
 		http.queue_free()
 		var status := code if result == HTTPRequest.RESULT_SUCCESS else 0
 		callback.call(status, response_headers, response_body))
-	var http_method := HTTPClient.METHOD_POST if method == "POST" else HTTPClient.METHOD_GET
-	var err := http.request(api_base() + path, PackedStringArray(headers), http_method, body)
+	var http_method := HTTPClient.METHOD_POST if method == "POST" else (HTTPClient.METHOD_DELETE if method == "DELETE" else HTTPClient.METHOD_GET)
+	var url := path if path.begins_with("https://") else api_base() + path
+	http.max_redirects = 0
+	var err: int
+	if body is PackedByteArray:
+		err = http.request_raw(url, PackedStringArray(headers), http_method, body)
+	else:
+		err = http.request(url, PackedStringArray(headers), http_method, str(body))
 	if err != OK:
 		http.queue_free()
 		callback.call_deferred(0, PackedStringArray(), PackedByteArray())
