@@ -7,6 +7,8 @@ const TEST_STORAGE_DIR := "user://ravensight_tests/"
 
 var fake_now: float = 1000.0
 var fake_unix: int = 1800000000
+## Added to fake_unix for the millisecond clock.
+var fake_ms: int = 0
 var mobile: bool = false
 ## What _random() returns: 0.5 is a jitter factor of exactly 1.0, so the
 ## backoff waits are the unspread 10, 20, 40 seconds.
@@ -33,6 +35,9 @@ func _now() -> float:
 
 func _unix_now() -> int:
 	return fake_unix
+
+func _unix_now_ms() -> int:
+	return fake_unix * 1000 + fake_ms
 
 func _storage_dir() -> String:
 	return TEST_STORAGE_DIR

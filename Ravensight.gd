@@ -324,10 +324,14 @@ var _retry_from_server: bool = false
 
 var _started_queued: bool = false
 var _exit_queued: bool = false
-## Unix time the SDK was constructed: game_started's timestamp.
+## Unix time the SDK was constructed.
 var _start_unix: int = 0
+## The same moment in milliseconds: game_started's timestamp.
+var _start_unix_ms: int = 0
 ## Unix time the app went to the background on Android or iOS, or 0.
 var _backgrounded_at: int = 0
+## The same moment in milliseconds: the old session's game_exited timestamp.
+var _backgrounded_at_ms: int = 0
 
 var _status_reason: String = ""
 ## The latest transient failure: "", "offline", "rate_limited" or
@@ -429,6 +433,7 @@ var _playtest_reason: String = ""
 func _init() -> void:
 	_start_unix = _unix_now()
 	_session_start_ms = _ticks_msec()
+	_start_unix_ms = _unix_now_ms()
 	_apply_playtest_env()
 	if playtest_token.is_empty():
 		# Read only: a saved id is used, but none is created before _ready()
@@ -641,6 +646,7 @@ func _on_backgrounded() -> void:
 	if not _is_ready or not _is_active():
 		return
 	_backgrounded_at = _unix_now()
+	_backgrounded_at_ms = _unix_now_ms()
 	_send_health_once()
 	_flush_pending(true)
 	if playtest_token.is_empty() and not session_token.is_empty():
@@ -648,6 +654,7 @@ func _on_backgrounded() -> void:
 			"sessionToken": session_token,
 			"expiresAt": session_expires_at,
 			"backgroundedAt": _backgrounded_at,
+			"backgroundedAtMs": _backgrounded_at_ms,
 		}))
 
 ## Back in the foreground. Under session_timeout nothing happens. At or past
@@ -665,7 +672,7 @@ func _on_foregrounded() -> void:
 		return
 	if float(_unix_now() - backgrounded_at) < session_timeout:
 		return
-	_queue_game_exited(backgrounded_at)
+	_queue_game_exited(_backgrounded_at_ms)
 	# Everything queued so far belongs to the old session; once it is
 	# delivered the session is dropped and a new one opens.
 	_session_boundary = pending_events.size()
@@ -698,7 +705,9 @@ func _send_exit_marker_if_any() -> void:
 	var backgrounded_at := int(marker.get("backgroundedAt", 0))
 	if token.is_empty() or backgrounded_at <= 0 or _unix_now() >= expires_at:
 		return
-	var body := JSON.stringify({"events": [{"event": "game_exited", "data": {}, "timestamp": backgrounded_at}]})
+	# A marker from before milliseconds holds seconds, which the server still reads.
+	var exited_at := int(marker.get("backgroundedAtMs", backgrounded_at))
+	var body := JSON.stringify({"events": [{"event": "game_exited", "data": {}, "timestamp": exited_at}]})
 	_send("POST", "/track/batch", ["Content-Type: application/json", "X-Session-Token: " + token], body, _ignore_response)
 
 func _ignore_response(_code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
@@ -830,9 +839,13 @@ func _remove_file(user_path: String) -> void:
 func _now() -> float:
 	return Time.get_ticks_msec() / 1000.0
 
-## Unix seconds, for event timestamps and session expiry.
+## Unix seconds, for session expiry and the background timeout.
 func _unix_now() -> int:
 	return int(Time.get_unix_time_from_system())
+
+## Unix milliseconds, for event timestamps.
+func _unix_now_ms() -> int:
+	return int(Time.get_unix_time_from_system() * 1000.0)
 
 ## 0 <= x < 1, for backoff jitter.
 func _random() -> float:
@@ -2052,7 +2065,7 @@ func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_fron
 	var event := {
 		"event": event_name,
 		"data": event_data,
-		"timestamp": timestamp if timestamp >= 0 else _unix_now(),
+		"timestamp": timestamp if timestamp >= 0 else _unix_now_ms(),
 	}
 	if at_front:
 		pending_events.push_front(event)
@@ -2116,7 +2129,7 @@ func _queue_game_started(at_boot: bool) -> void:
 		return
 	_started_queued = true
 	if at_boot:
-		_enqueue_and_emit("game_started", {}, _start_unix, true)
+		_enqueue_and_emit("game_started", {}, _start_unix_ms, true)
 	else:
 		_enqueue_and_emit("game_started", {})
 

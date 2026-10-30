@@ -714,6 +714,7 @@ func test_mobile_background_under_timeout() -> void:
 	if marker is Dictionary:
 		eq(marker["sessionToken"], sdk.session_token, "marker token")
 		eq(int(marker["backgroundedAt"]), sdk.fake_unix, "marker time")
+		eq(int(marker["backgroundedAtMs"]), sdk.fake_unix * 1000, "marker time in milliseconds")
 		eq(int(marker["expiresAt"]), sdk.session_expires_at, "marker expiry")
 	sdk.answer_all_ok()
 	sdk.fake_unix += 1799
@@ -731,7 +732,7 @@ func test_mobile_background_past_timeout() -> void:
 	sdk.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
 	var exit_req: Dictionary = sdk.unanswered()[0]
 	eq(sdk.event_names(exit_req), ["game_exited"], "game_exited sent first, alone")
-	eq(int(sdk.events_in(exit_req)[0]["timestamp"]), backgrounded_at, "at the moment it went to the background")
+	eq(int(sdk.events_in(exit_req)[0]["timestamp"]), backgrounded_at * 1000, "at the moment it went to the background")
 	eq(sdk.header(exit_req, "X-Session-Token"), old_token, "under the old session")
 	sdk.answer(202, {})
 	eq(sdk.unanswered()[0]["path"], "/session", "then a new session opens")
@@ -739,12 +740,31 @@ func test_mobile_background_past_timeout() -> void:
 	var start_req: Dictionary = sdk.unanswered()[0]
 	eq(sdk.event_names(start_req), ["game_started"], "game_started in the new session")
 	eq(sdk.header(start_req, "X-Session-Token"), "fresh", "under the new token")
-	eq(int(sdk.events_in(start_req)[0]["timestamp"]), sdk.fake_unix, "at the return time")
+	eq(int(sdk.events_in(start_req)[0]["timestamp"]), sdk.fake_unix * 1000, "at the return time")
 	sdk.answer(202, {})
 	sdk.quit()
 	sdk.answer_all_ok()
 	var exits := sent_count(sdk, "game_exited")
 	eq(exits, 2, "the new session gets its own game_exited on quit")
+
+func test_event_timestamps_are_milliseconds() -> void:
+	var sdk := start()
+	sdk.fake_ms = 200
+	sdk.track_event("first")
+	sdk.fake_ms = 700
+	sdk.track_event("second")
+	var stamps := {}
+	for event in sdk.pending_events:
+		stamps[event["event"]] = int(event["timestamp"])
+	eq(stamps["first"], sdk.fake_unix * 1000 + 200, "the first event keeps its milliseconds")
+	eq(stamps["second"], sdk.fake_unix * 1000 + 700, "and the second, in the same second, its own")
+	var wire: Variant = JSON.parse_string(JSON.stringify({"timestamp": stamps["second"]}))
+	eq(int(wire["timestamp"]), sdk.fake_unix * 1000 + 700, "a millisecond timestamp survives the JSON a batch is sent as")
+
+func test_cold_launch_marker_in_milliseconds() -> void:
+	_write("ravensight_bg.save", JSON.stringify({"sessionToken": "old_tok", "expiresAt": 1800000000 + 3600, "backgroundedAt": 1800000000 - 50, "backgroundedAtMs": 1799999950250}))
+	var sdk := start()
+	eq(int(sdk.events_in(sdk.requests[0])[0]["timestamp"]), 1799999950250, "the marker's milliseconds win")
 
 func test_cold_launch_marker() -> void:
 	_write("ravensight_bg.save", JSON.stringify({"sessionToken": "old_tok", "expiresAt": 1800000000 + 3600, "backgroundedAt": 1800000000 - 50}))
@@ -821,13 +841,13 @@ func test_later_enable_stamps_game_started_now() -> void:
 	var sdk := start({"enabled": false})
 	sdk.fake_unix += 120
 	sdk.set_enabled(true)
-	eq(int(sdk.pending_events[0]["timestamp"]), sdk.fake_unix, "game_started carries the time it was enabled")
+	eq(int(sdk.pending_events[0]["timestamp"]), sdk.fake_unix * 1000, "game_started carries the time it was enabled")
 
 	_write("ravensight_optout.save", "1")
 	var opted := start()
 	opted.fake_unix += 300
 	opted.set_tracking_enabled(true)
-	eq(int(opted.pending_events[0]["timestamp"]), opted.fake_unix, "and the time the player opted in")
+	eq(int(opted.pending_events[0]["timestamp"]), opted.fake_unix * 1000, "and the time the player opted in")
 
 	var quitter := make()
 	quitter.quit()

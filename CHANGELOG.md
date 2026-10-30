@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Event timestamps are unix milliseconds, so events in one second keep their order in funnels and sessions. Needs a Ravensight server that keeps milliseconds. Older versions keep working unchanged, and events queued by an older version are sent as they were recorded.
+
 ## [0.4.0] - 2026-11-06
 
 ### Added
