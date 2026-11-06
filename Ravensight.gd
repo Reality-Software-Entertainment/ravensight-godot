@@ -166,6 +166,10 @@ const ERROR_CAPTURE_MAX_TRAILS: int = 10
 const ERROR_CAPTURE_PER_MINUTE: int = 6
 ## Boot errors held in memory until the game's switch is known.
 const MAX_HELD_ERRORS: int = 5
+## Engine source files that log the SDK's own request failures (HTTP, TLS,
+## sockets). With an SDK request in flight and no script frame, an error
+## from one of them is the SDK's own and never captured.
+const SDK_NETWORK_FILES: Array[String] = ["scene/main/http_request", "core/io/http_client", "core/io/stream_peer", "core/io/ip", "core/io/net_socket", "drivers/unix/net_socket", "drivers/unix/ip_unix", "drivers/windows/net_socket", "platform/web/http_client", "modules/mbedtls/"]
 ## The trail: the last TRAIL_LINES lines, each at most TRAIL_LINE_CHARS,
 ## sent joined (oldest first) and at most TRAIL_CHARS.
 const TRAIL_LINES: int = 20
@@ -180,13 +184,17 @@ const LOGGER_ERROR_TYPES: Array[String] = ["ERROR", "WARNING", "SCRIPT", "SHADER
 ## It runs on whatever thread logged, so it only copies plain values into a
 ## Mutex-guarded buffer; the SDK drains that buffer on the main thread.
 const _LOGGER_SOURCE := """extends Logger
-const MAX_PENDING := 64
+const MAX_ERRORS := 64
+const MAX_MESSAGES := 32
 const MAX_FRAMES := 20
 var active := true
 var want_messages := false
 var sdk_busy := false
+var sdk_requests := 0
 var _mutex := Mutex.new()
-var _pending: Array = []
+var _errors: Array = []
+var _messages: Array = []
+var _seq := 0
 
 func _log_error(function: String, file: String, line: int, code: String, rationale: String, _editor_notify: bool, error_type: int, script_backtraces: Array[ScriptBacktrace]) -> void:
 	if not active:
@@ -198,24 +206,31 @@ func _log_error(function: String, file: String, line: int, code: String, rationa
 		for i in mini(bt.get_frame_count(), MAX_FRAMES):
 			frames.append([bt.get_frame_function(i), bt.get_frame_file(i), bt.get_frame_line(i)])
 	var own := sdk_busy and OS.get_thread_caller_id() == OS.get_main_thread_id()
-	_push({"kind": "error", "function": function, "file": file, "line": line, "code": code.substr(0, 1000), "rationale": rationale.substr(0, 1000), "type": error_type, "frames": frames, "own": own, "ms": Time.get_ticks_msec()})
+	_push(_errors, MAX_ERRORS, {"kind": "error", "function": function, "file": file, "line": line, "code": code.substr(0, 1000), "rationale": rationale.substr(0, 1000), "type": error_type, "frames": frames, "own": own, "net": sdk_requests > 0, "ms": Time.get_ticks_msec()})
 
 func _log_message(message: String, error: bool) -> void:
 	if not active or not want_messages:
 		return
-	_push({"kind": "message", "text": message.substr(0, 400), "error": error, "ms": Time.get_ticks_msec()})
+	_push(_messages, MAX_MESSAGES, {"kind": "message", "text": message.substr(0, 400), "error": error, "ms": Time.get_ticks_msec()})
 
-func _push(entry: Dictionary) -> void:
+## Errors and printed lines have separate buffers, so a flood of printed
+## lines never pushes out an error.
+func _push(buffer: Array, limit: int, entry: Dictionary) -> void:
 	_mutex.lock()
-	if _pending.size() < MAX_PENDING:
-		_pending.append(entry)
+	_seq += 1
+	entry["seq"] = _seq
+	if buffer.size() < limit:
+		buffer.append(entry)
 	_mutex.unlock()
 
+## Everything buffered, in the order it was logged.
 func drain() -> Array:
 	_mutex.lock()
-	var out := _pending
-	_pending = []
+	var out := _errors + _messages
+	_errors = []
+	_messages = []
 	_mutex.unlock()
+	out.sort_custom(func(x, y): return x["seq"] < y["seq"])
 	return out
 """
 
@@ -372,6 +387,9 @@ var _error_trail_enabled: bool = false
 ## The installed Logger (an instance of _LOGGER_SOURCE), or null.
 var _error_logger: Object = null
 var _error_logger_script: GDScript = null
+## Set once compiling the Logger failed, so it is never retried this run.
+var _error_logger_failed: bool = false
+var _template_rules: Array = []
 ## _ticks_msec() when the current session began: trail lines count from it.
 var _session_start_ms: int = 0
 ## Per session caps (see ERROR_CAPTURE_MAX_PER_SESSION and friends).
@@ -833,11 +851,28 @@ func _send(method: String, path: String, headers: Array, body: Variant, callback
 	_send_http(method, path, headers, body, callback)
 	_set_sdk_busy(false)
 
+## SDK requests started and not yet answered. The engine logs HTTP and TLS
+## failures later, from C++, with no script frame: while this is above 0
+## such errors are taken as the SDK's own (see SDK_NETWORK_FILES).
+var _requests_in_flight: int = 0
+
+func _request_started() -> void:
+	_requests_in_flight += 1
+	if _error_logger != null:
+		_error_logger.set("sdk_requests", _requests_in_flight)
+
+func _request_finished() -> void:
+	_requests_in_flight = maxi(0, _requests_in_flight - 1)
+	if _error_logger != null:
+		_error_logger.set("sdk_requests", _requests_in_flight)
+
 func _send_http(method: String, path: String, headers: Array, body: Variant, callback: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = REQUEST_TIMEOUT_SECONDS
 	add_child(http)
+	_request_started()
 	http.request_completed.connect(func(result: int, code: int, response_headers: PackedStringArray, response_body: PackedByteArray) -> void:
+		_request_finished()
 		http.queue_free()
 		var status := code if result == HTTPRequest.RESULT_SUCCESS else 0
 		callback.call(status, response_headers, response_body))
@@ -850,6 +885,7 @@ func _send_http(method: String, path: String, headers: Array, body: Variant, cal
 	else:
 		err = http.request(url, PackedStringArray(headers), http_method, str(body))
 	if err != OK:
+		_request_finished()
 		http.queue_free()
 		callback.call_deferred(0, PackedStringArray(), PackedByteArray())
 
@@ -1005,9 +1041,8 @@ func _on_settings_response(code: int, headers: PackedStringArray, body: PackedBy
 		return
 	else:
 		_log_once("settings_failed", "Ravensight: could not fetch settings (HTTP %d); assuming tracking enabled" % code, false)
-	if not _error_settings_known:
-		# No answer to read: the game's switch is assumed at its default.
-		_apply_error_capture_settings(null, true)
+	# A failed settings check says nothing about the game's switch: boot
+	# errors stay held until the session answer decides.
 	_flush_pending()
 
 ## --- Session management (POST /api/v1/session) ---------------------------------
@@ -1405,17 +1440,28 @@ func _install_error_logger() -> void:
 	if not _error_capture_supported():
 		_log_once("error_capture_unavailable", "Ravensight: automatic error capture needs Godot 4.5 or later; track_error() still works", false)
 		return
+	if _error_logger_failed:
+		return
 	if _error_logger_script == null:
-		var script := GDScript.new()
-		script.source_code = _LOGGER_SOURCE
-		if script.reload() != OK:
+		_error_logger_script = _compile_logger_script()
+		if _error_logger_script == null:
+			# Never tried again this run.
+			_error_logger_failed = true
 			_log_once("error_capture_unavailable", "Ravensight: automatic error capture could not start on this engine; track_error() still works", false)
 			return
-		_error_logger_script = script
 	var logger: Object = _error_logger_script.new()
 	logger.set("want_messages", _error_trail_enabled)
+	logger.set("sdk_requests", _requests_in_flight)
 	OS.call("add_logger", logger)
 	_error_logger = logger
+
+## Compiles _LOGGER_SOURCE, or returns null when the engine refuses it.
+func _compile_logger_script() -> GDScript:
+	var script := GDScript.new()
+	script.source_code = _LOGGER_SOURCE
+	if script.reload() != OK:
+		return null
+	return script
 
 func _uninstall_error_logger() -> void:
 	if _error_logger == null:
@@ -1446,6 +1492,12 @@ func _drain_error_logger() -> void:
 		else:
 			_capture_logged_error(entry)
 
+func _is_network_file(file: String) -> bool:
+	for prefix in SDK_NETWORK_FILES:
+		if file.contains(prefix):
+			return true
+	return false
+
 func _is_sdk_text(text: String) -> bool:
 	return text.begins_with("Ravensight")
 
@@ -1472,6 +1524,8 @@ func _capture_logged_error(entry: Dictionary) -> void:
 		return
 	if not frames.is_empty() and _is_sdk_file(str(frames[0][1])):
 		return
+	if entry.get("net") and frames.is_empty() and _is_network_file(file):
+		return
 	var type_index := int(entry.get("type", 0))
 	var error_type: String = LOGGER_ERROR_TYPES[type_index] if type_index >= 0 and type_index < LOGGER_ERROR_TYPES.size() else "ERROR"
 	var is_script := type_index == 2
@@ -1482,14 +1536,18 @@ func _capture_logged_error(entry: Dictionary) -> void:
 		# A release build without call stack tracking still names the place.
 		stack_lines.append("at %s (%s:%d)" % [entry.get("function", ""), file, int(entry.get("line", 0))])
 	var level := "error" if (is_script or type_index == 0) else "warning"
-	var scrubbed := _scrub(message)
 	var first_frame := ""
 	if not frames.is_empty():
 		first_frame = "%s:%s" % [frames[0][1], frames[0][0]]
 	elif is_script:
 		first_frame = "%s:%s" % [file, entry.get("function", "")]
-	var key := "%s|%s|%s" % [error_type, _message_template(scrubbed), first_frame]
+	if _errors_captured >= ERROR_CAPTURE_MAX_PER_SESSION:
+		_trail_add(int(entry.get("ms", 0)), level, message)
+		return
+	# The caps come before the scrub, so a flood costs no scrub work.
+	var key := "%s|%s|%s" % [error_type, _message_template(message), first_frame]
 	if _allow_capture(key):
+		var scrubbed := _scrub(message)
 		var props := {
 			"rs_kind": "error",
 			"rs_severity": "error" if is_script else "warning",
@@ -1575,12 +1633,12 @@ func _scrub(text: String) -> String:
 			# A URL loses its query and fragment.
 			["(\\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\\s?#]*)[?#][^\\s]*", "$1"],
 			["[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[email]"],
-			["(?i)\\bbearer\\s+[A-Za-z0-9._~+/=-]+", "Bearer [token]"],
+			["(?i)\\bbearer\\s+[A-Za-z0-9._~+=-]+", "Bearer [token]"],
 			["\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*", "[token]"],
 			["\\bgt_[A-Za-z0-9_]+", "[token]"],
 			# Runs of 32 or more base64 or hex characters with at least one
 			# digit, so long snake_case function names in a stack survive.
-			["(?<![A-Za-z0-9+/=_-])(?=[A-Za-z_+/=-]*[0-9])[A-Za-z0-9+/=_-]{32,}", "[token]"],
+			["(?<![A-Za-z0-9+=_-])(?=[A-Za-z_+=-]*[0-9])[A-Za-z0-9+=_-]{32,}", "[token]"],
 			["\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b", "[ip]"],
 			# IPv6: the full eight groups, or a compressed form with "::".
 			["(?i)\\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\\b|\\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4}\\b|(?<![\\w:])::1\\b", "[ip]"],
@@ -1599,17 +1657,20 @@ func _scrub(text: String) -> String:
 
 ## The message with its variable parts replaced, for the local dedupe key.
 func _message_template(message: String) -> String:
+	if _template_rules.is_empty():
+		for pair in [
+			["[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", "<uuid>"],
+			["\\b[a-zA-Z][a-zA-Z0-9+.-]*://\\S+", "<url>"],
+			["\"[^\"]*\"|'[^']*'", "<str>"],
+			["\\b[0-9a-fA-F]{8,}\\b", "<hex>"],
+			["\\d+(\\.\\d+)?", "<n>"],
+		]:
+			var re := RegEx.new()
+			re.compile(pair[0])
+			_template_rules.append([re, pair[1]])
 	var out := message
-	for pair in [
-		["[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", "<uuid>"],
-		["\\b[a-zA-Z][a-zA-Z0-9+.-]*://\\S+", "<url>"],
-		["\"[^\"]*\"|'[^']*'", "<str>"],
-		["\\b[0-9a-fA-F]{8,}\\b", "<hex>"],
-		["\\d+(\\.\\d+)?", "<n>"],
-	]:
-		var re := RegEx.new()
-		re.compile(pair[0])
-		out = re.sub(out, pair[1], true)
+	for rule in _template_rules:
+		out = (rule[0] as RegEx).sub(out, rule[1], true)
 	return out
 
 ## --- Health sampling ---------------------------------------------------------------

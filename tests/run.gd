@@ -117,6 +117,10 @@ func _run() -> void:
 		"test_boot_errors_cleared_on_optout_and_kill",
 		"test_boot_errors_wait_for_session_after_settings_429",
 		"test_tests_never_reach_the_network",
+		"test_sdk_network_errors_skipped_while_in_flight",
+		"test_logger_compile_failure_tried_once",
+		"test_boot_errors_dropped_on_exit",
+		"test_printed_lines_never_evict_errors",
 	]
 	for name in tests:
 		_current = name
@@ -1479,7 +1483,8 @@ func test_error_capture_waits_for_settings() -> void:
 	sdk.answer_all_ok()
 	var other := start()
 	other.answer(500, {})
-	eq(other.is_error_capture_active(), logger_engine(), "a failed settings check means the default: on")
+	eq(other.is_error_capture_active(), logger_engine(), "a failed settings check leaves it installed, holding")
+	check(not other._error_settings_known, "and decides nothing about the switch")
 
 func test_error_capture_needs_key_consent_and_enabled() -> void:
 	var nokey := start({"ingest_key": ""})
@@ -1680,6 +1685,9 @@ func test_error_scrub_rules() -> void:
 		"GET https://api.example.com/v1/x?token=1#frag failed": "GET https://api.example.com/v1/x failed",
 		"res://game/player.gd:12": "res://game/player.gd:12",
 		"at handle_the_very_long_inventory_update_request (res://a.gd:3)": "at handle_the_very_long_inventory_update_request (res://a.gd:3)",
+		"res://addons/inventory_system2/ui/inventory_slot.gd:42": "res://addons/inventory_system2/ui/inventory_slot.gd:42",
+		"at f (res://addons/inventory_system2/ui/panels/inventory_slot_view.gd:7)": "at f (res://addons/inventory_system2/ui/panels/inventory_slot_view.gd:7)",
+		"key abcdefghijklmnopqrstuvwxyz0123456789 end": "key [token] end",
 	}
 	for input in cases:
 		eq(sdk._scrub(input), cases[input], "scrub '%s'" % input)
@@ -1756,7 +1764,10 @@ func test_boot_errors_held_then_sent() -> void:
 		fresh.advance(0.0)
 		eq(fresh._held_errors.size(), 1, "a real push_error before the answer is held")
 		fresh.answer(500, {})
-		eq(queued_errors(fresh).size(), 1, "and sent when settings fail (default on)")
+		eq(fresh._held_errors.size(), 1, "a failed settings check keeps it held")
+		eq(queued_errors(fresh).size(), 0, "not sent yet")
+		fresh.answer(201, {"token": "t", "expiresIn": 86400})
+		eq(queued_errors(fresh).size(), 1, "the session answer (absent errorCapture means on) sends it")
 
 func test_boot_errors_discarded_when_switch_off() -> void:
 	var sdk := start()
@@ -1803,3 +1814,67 @@ func test_tests_never_reach_the_network() -> void:
 	sdk._send_http("GET", "/settings", [], "", func(_c, _h, _b): pass)
 	eq(sdk.network_attempts, ["GET /settings"], "and the real one is replaced too")
 	sdk.free()
+
+func test_sdk_network_errors_skipped_while_in_flight() -> void:
+	var sdk := started_with_capture()
+	var net := logged("Connection error", 0, [], {"file": "scene/main/http_request.cpp", "function": "_update_connection"})
+	var tls := logged("TLS handshake error: -9984", 0, [], {"file": "modules/mbedtls/tls_context_mbedtls.cpp"})
+	sdk._request_started()
+	sdk._capture_logged_error(net.merged({"net": true}))
+	sdk._capture_logged_error(tls.merged({"net": true}))
+	eq(queued_errors(sdk), [], "engine network errors during an SDK request are the SDK's own")
+	sdk._request_finished()
+	sdk._capture_logged_error(net.merged({"net": false}))
+	eq(queued_errors(sdk).size(), 1, "with no SDK request in flight they are the game's")
+	if not logger_engine() or sdk._error_logger == null:
+		return
+	# Through the real Logger object: the in-flight flag is read at log time.
+	var none: Array[ScriptBacktrace] = []
+	sdk._request_started()
+	sdk._error_logger.call("_log_error", "_update_connection", "scene/main/http_request.cpp", 10, "Connection refused", "", false, 0, none)
+	sdk._request_finished()
+	sdk.advance(0.0)
+	eq(queued_errors(sdk).size(), 1, "a faked _log_error while in flight is skipped")
+	sdk._error_logger.call("_log_error", "_update_connection", "scene/main/http_request.cpp", 10, "Connection refused", "", false, 0, none)
+	sdk.advance(0.0)
+	eq(queued_errors(sdk).size(), 2, "one logged after the request finished is the game's")
+
+func test_logger_compile_failure_tried_once() -> void:
+	var sdk := make()
+	sdk.fail_logger_compile = true
+	root.add_child(sdk)
+	sdk.answer_all_ok()
+	sdk.set_error_capture(false)
+	sdk.set_error_capture(true)
+	sdk.set_tracking_enabled(false)
+	sdk.set_tracking_enabled(true)
+	sdk._update_error_capture()
+	check(not sdk.is_error_capture_active(), "not installed")
+	if logger_engine():
+		eq(sdk.compile_attempts, 1, "compiled once, never retried")
+		check(sdk._logged_once.has("error_capture_unavailable"), "logged once")
+
+func test_boot_errors_dropped_on_exit() -> void:
+	var sdk := start()
+	sdk._capture_logged_error(logged("boot failure"))
+	sdk.answer(500, {})
+	eq(sdk._held_errors.size(), 1, "held through a failed settings check")
+	root.remove_child(sdk)
+	eq(sdk._held_errors, [], "discarded unsent on shutdown")
+	eq(sent_count(sdk, "error"), 0, "never sent")
+	sdk.free()
+
+func test_printed_lines_never_evict_errors() -> void:
+	if not logger_engine():
+		return
+	var sdk := started_with_capture({"enabled": true, "trail": true})
+	for i in 100:
+		print("chatty line %d" % i)
+	push_error("the real problem")
+	sdk.advance(0.0)
+	eq(queued_errors(sdk).map(func(d): return d["rs_message"]), ["the real problem"], "the error survives a flood of printed lines")
+	var trail := str(queued_errors(sdk)[0].get("rs_trail", ""))
+	var lines := trail.split("\n")
+	eq(lines.size(), 20, "a full trail of buffered lines")
+	check(lines[19].contains(" info chatty line "), "oldest first, the newest printed line last: " + lines[19])
+	check(sdk._error_logger.call("drain").is_empty(), "the buffers are empty after the drain")

@@ -336,7 +336,10 @@ build still sends a script error's own function, file and line, and
 player's consent (`consent = "opt_in"`), or while the SDK is off. The hook
 goes in at startup so errors during boot are not lost, but until the
 settings check answers, at most 5 captures are held in memory: they are
-sent once the answer says capture is on, and discarded unsent if it is off.
+sent once an answer says capture is on, and discarded unsent if it is off
+or the game quits first. A failed settings check keeps them held until the
+session answer decides. Engine HTTP and TLS errors logged while one of the
+SDK's own requests is in flight count as the SDK's own.
 The error capture setting in the game's settings turns capture off for
 every player; `error_capture = false` or `set_error_capture(false)` turns
 it off in your build. Opting out, or the server's kill switch, removes the

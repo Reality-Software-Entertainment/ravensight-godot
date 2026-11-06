@@ -49,6 +49,16 @@ func _memory_mb() -> float:
 func _ticks_msec() -> int:
 	return ticks
 
+## True makes compiling the Logger fail; compile_attempts counts tries.
+var fail_logger_compile: bool = false
+var compile_attempts: int = 0
+
+func _compile_logger_script() -> GDScript:
+	compile_attempts += 1
+	if fail_logger_compile:
+		return null
+	return super()
+
 func _error_capture_supported() -> bool:
 	return logger_supported and super()
 
