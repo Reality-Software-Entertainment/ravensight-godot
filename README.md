@@ -63,7 +63,7 @@ It is safe to call from any autoload, even before Ravensight's own
 | `distribution` | `""` | A short label for this build, such as `"native-demo"` or `"web-itch"`, sent on the session. At most 40 characters, no control characters, otherwise not sent. |
 | `game_version` | `1.0.0` | Sent with every session. |
 | `enabled` | `true` | `false` turns the SDK off for this run: no request of any kind, nothing queued, no `game_started`, until `set_enabled(true)`. Never saved. `set_tracking_enabled()` still saves the player's choice while it is `false`. |
-| `max_queue_size` | `500` | Unsent events kept. The oldest are dropped first; a queued `game_started` is kept. |
+| `max_queue_size` | `500` | Unsent events kept, in memory and on disk, at most 500. The oldest are dropped first; this run's `game_started` is kept. |
 | `flush_interval` | `5.0` | Seconds an event waits so it can go out with others. 50 waiting events go at once. |
 | `handle_quit` | `true` | Take over the window close (and the Android back button when it quits) to send the last events, holding the quit at most 1.5 seconds. See Quitting. |
 | `performance` | `false` | Opt in to one `health` event per session with frame rate, memory and boot time. See Typed events. |
@@ -93,6 +93,13 @@ It is safe to call from any autoload, even before Ravensight's own
 | `track_error(severity, message, options = {})` | Queue an error: `debug`, `info`, `warning`, `error` or `critical`. |
 | `set_error_capture(on)` | Turns automatic error capture on or off for this run. Never saved. |
 | `is_error_capture_active()` | `true` while the capture hook is installed. |
+| `track_ad(network, format, result, options = {})` | Queue an ad lifecycle step. Returns `false` and sends nothing when a field is malformed. See Ads and attribution. |
+| `track_ad_revenue(network, format, placement, revenue_micros, currency)` | Queue a paid impression (`result` `shown`). |
+| `micros_from_decimal_string(text)`, `micros_from_revenue(value)` | Static. Revenue in micros as a digit string, without multiplying a float. |
+| `set_attribution(attribution)` | Queue where this install was acquired, once per install. |
+| `get_device_id()` | This install's random device id, for an attribution partner's customer user id. |
+| `get_config(key, fallback)` | A remote config value. The first read in a session marks running experiments as exposed. See Remote configuration and experiments. |
+| `get_delivery_stats()` | Events let go of since launch: `dropped_overflow`, `dropped_too_old`, `dropped_refused`. |
 | `fetch_suggestions()` | Experimental. Answers on `suggestions_received`; while tracking is off nothing is requested and it answers with an empty list. |
 
 `Ravensight.session_token` is the open session's token, or `""` until one
@@ -117,7 +124,8 @@ this token and have it send it as `joinToken` when it opens its own session
 
 ## Automatic events
 
-The SDK sends exactly two events by itself:
+The SDK sends these events by itself: `game_started` and `game_exited`
+below, and `rs_exposure` (see Remote configuration and experiments).
 
 - **`game_started`**, once per session. It is queued at launch, first in the
   queue with the launch time, and sent once the kill switch check allows it.
@@ -136,8 +144,9 @@ foreground within 30 minutes (`session_timeout`), nothing happens. After 30
 minutes or more, the old session gets `game_exited` stamped with the moment
 the app went to the background, and a new session starts with
 `game_started`. If the player swipes the app away while it is in the
-background, the next launch sends that `game_exited` from the marker (one
-attempt, before anything else) and deletes the marker.
+background, the next launch queues that `game_exited` from the marker, under the old
+session's origin, and deletes the marker; it is delivered and retried like
+any queued event.
 
 **Web export.** The browser gives a Godot web game no close notification,
 so a web build never sends `game_exited`. `game_started` and everything you
@@ -174,18 +183,51 @@ fires when that changes:
 | `""` | Nothing is wrong: a session is open, or opening normally. |
 | `no_key` | Started with no ingest key. Inert for the run. |
 | `disabled` | `enabled` is `false`, the player opted out, or `consent = "opt_in"` and the player has not said yes. |
-| `invalid_key` | The server refused the ingest key (401, or a 403 that is not one of the codes below), on the settings check, the session, a batch or feedback. Logged once as `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.` The run ends: the queue is cleared, nothing is retried, and `flush()` sends nothing. A 401 on a batch is an expired session instead: the SDK opens a new one first. |
-| `tracking_disabled` | The kill switch is off for your game. The queue is dropped and nothing more is sent this run. |
-| `offline` | No answer (no connection, or no reply within 15 seconds). Retried after 10 seconds, doubling up to 5 minutes, each wait spread by plus or minus 20 percent; events are kept. |
+| `invalid_key` | The server refused the ingest key (401, or a 403 that is not one of the codes below), on the settings check, the session, a batch or feedback. Logged once as `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.` Nothing more is sent or retried this run; the queued events stay on disk for the next launch. A 401 on a batch is an expired session or a refused signature instead: the SDK opens a new session once, and a second 401 in a row waits for the backoff. |
+| `tracking_disabled` | The kill switch is off for your game. Nothing more is sent this run; the queued events stay on disk. |
+| `offline` | No answer (no connection, or no reply within 15 seconds). Retried after 10 seconds, doubling up to 5 minutes, each wait multiplied by a random factor from 0.5 up to 1; events are kept. |
 | `rate_limited` | The server said slow down (429, or 503 with Retry-After). The SDK waits exactly the Retry-After time. |
 | `session_failed` | Opening a session failed for another reason (retried with the same backoff), or a playtest token was refused. |
 | `playtest_job_closed` | The playtest job this run belongs to has closed. Nothing more is sent. |
 
-If the server refuses one oversized event, the batch is halved until that
-event is alone, then it is dropped and reported on `flush_failed`, so it
-never costs the events around it. Events can be lost: the oldest go when
-more than `max_queue_size` are waiting, and whatever is still unsent when the
-game quits is not saved for the next launch.
+## Delivery
+
+Events are never lost to a crash, a closed game or a dead connection:
+
+- **Saved queue.** Unsent events are written to
+  `user://ravensight/queue-<16 hex>.json` (one file per ingest key, named by
+  a hash of the key), with a temporary file renamed over the old one so a
+  partial write never replaces a good file. The file is read once when
+  sending starts. At most 500 events are kept across launches, oldest
+  dropped first (an automatic error is always dropped before a gameplay
+  event, and queues behind gameplay), and events older than 89 days are
+  dropped when it is read
+  (the server keeps nothing past 90). `get_delivery_stats()` counts both.
+- **Removed only when delivered.** An event leaves the file only after a 2xx
+  answer, or a 400 that refuses it, and that removal is saved first.
+- **Origin.** Each session's events are saved with the session answer's
+  `origin`. When a later launch sends them, every one carries that origin, so
+  the server files them under the session, build and platform they happened
+  in. The origin's `stamp` is a credential for that old session; it is kept
+  only in the queue file and never logged.
+- **Ids.** Every event carries an `rs_event_id` made when it was tracked, and
+  keeps it on every resend, so a resend whose first delivery was stored is
+  dropped as a duplicate (within the key's duplicate window, 24 hours by
+  default).
+- **Compression.** A request body of 1,024 bytes or more is sent gzip
+  compressed. A 415 (or a 413 for one event) is sent once more uncompressed.
+- **Signing.** When the session answer has `signing` (public keys), every
+  batch carries `X-Ravensight-Timestamp` and an HMAC-SHA256
+  `X-Ravensight-Signature` over the uncompressed body, with the device clock
+  corrected by the server's time. The secret stays in memory, never on disk.
+- **Refusals.** A 400 naming one event by `index` drops that event and resends
+  the rest. `batch_too_large` and 413 halve the batch. A 400 about one event
+  with no index (such as `event_too_large`) halves until that event is alone,
+  then drops it. Any other 400 drops the request's events. Every drop is
+  logged once, reported on `flush_failed` and counted. A 429, or a 503 with
+  Retry-After, waits exactly the server's time. Turning tracking off as the
+  player (`set_tracking_enabled(false)`) or resetting the identity deletes the
+  saved queue.
 
 ## Public builds
 
@@ -249,6 +291,7 @@ key and none of these options.
 | 0.2.0 | 4.x (CI on 4.5-stable) | `/api/v1` | The shared SDK contract. |
 | Unreleased | 4.x, error capture on 4.5+ (CI on 4.5-stable) | `/api/v1` | Automatic error capture needs the API's error capture support; turn it off with `error_capture = false` against an older API. |
 | 0.3.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
+| After 0.4.0 (unreleased) | 4.x (CI on 4.5-stable) | `/api/v1` | Saved queue, origin, gzip and signing, ads and attribution, exposure tagging, device fields. Needs a Ravensight server that keeps millisecond timestamps, accepts `origin`, gzip and signatures, and knows the `rs_ad_*` and `rs_attr_*` keys. |
 
 ## Levels and deaths
 
@@ -384,6 +427,36 @@ and iOS), when the page is hidden (web) or when the game quits (desktop).
 With no sample taken nothing is sent, and sampling never sends anything
 itself. It is off by default.
 
+## Ads and attribution
+
+```gdscript
+# A paid impression from a mediation callback. Revenue is MICROS of the
+# currency as a digit string: 0.0015 USD is "1500". Never multiply a float.
+Ravensight.track_ad_revenue("admob", "rewarded", "level_end", ad_value.value_micros, ad_value.currency_code)
+Ravensight.track_ad_revenue("applovin", "interstitial", "", Ravensight.micros_from_revenue(revenue), "USD")
+# Clicks, rewards and failures carry no revenue.
+Ravensight.track_ad("applovin", "rewarded", "rewarded", {"placement": "shop"})
+# Where this install came from, sent once per install.
+Ravensight.set_attribution({"source": "store_referrer", "campaign": "spring"})
+```
+
+`format` is one of `banner`, `interstitial`, `rewarded`, `native`,
+`app_open`, `other`; `result` one of `shown`, `clicked`, `failed`,
+`rewarded`. Revenue goes on `shown` only and always with a three letter
+currency, which is never converted. `micros_from_revenue()` formats the
+double to 6 decimals and `micros_from_decimal_string()` rounds half up on the
+digits. A malformed call returns `false`, logs one warning and sends
+nothing. The events are named `rs_ad` and `rs_attribution` unless you pass
+`event_name`.
+
+`set_attribution()` takes `source` (`utm`, `store_referrer`, `organic` or a
+partner name), `network`, `campaign`, `adset`, `creative` and `touch_time`
+(epoch milliseconds). It is sent once per install: a flag saved in
+`user://ravensight_attribution.save` stops later calls, and
+`reset_device_id()` clears it. To let an attribution partner's install
+callback name this device, pass `Ravensight.get_device_id()` to the partner
+as its customer user id before the partner starts.
+
 ## Player privacy
 
 The device id is 16 random bytes from the operating system's secure random
@@ -397,12 +470,22 @@ Ravensight.set_tracking_enabled(false)  # saved; nothing is sent while off
 Ravensight.reset_device_id()            # forget this install's analytics identity
 ```
 
+Besides the events your game tracks, the SDK sends, when the engine reports
+them without a permission prompt:
+
+- **Device fields** on the session: `model` (`OS.get_model_name()`, left out
+  on desktop where Godot has none), `osVersion` (`OS.get_version()`, the
+  version only) and `gpu` (`RenderingServer.get_video_adapter_name()`). Each
+  is at most 128 printable characters; none is a hardware identifier.
+  Country is never sent by the SDK.
+
 `set_tracking_enabled()` writes the choice at once and can be called at any
 time, even from an autoload that runs before Ravensight's `_ready()`, or
 while `enabled` is `false`. A saved opt-out wins over `enabled = true`: on
 the next launch nothing is sent, not even the kill switch check. Turning it
-off drops the queue. `reset_device_id()` saves a new random id, drops the
-queue and the session, and returns the new id.
+off drops the queue and deletes the saved queue file. `reset_device_id()`
+saves a new random id, drops the queue (and its file), the session and the
+attribution flag, and returns the new id.
 
 ## Telling players
 
@@ -495,9 +578,16 @@ Opt-out and identity changes discard late responses. Getters use your fallback
 for missing keys or a different type; JSON numbers accept float defaults and
 whole numbers accept integer defaults. Arrays and dictionaries are copied.
 
-Events tracked after a config is available automatically carry active
-`rs_exp_<key>` labels, including typed helpers. Already queued events keep their
-original labels. Refresh to pick up stopped experiments. A fresh config response
+A fetch alone exposes nothing: the player has not seen a variant until the
+game uses a value. The first `get_config()` read in a session marks every
+running experiment in the config as exposed. From then on every event
+queued in that session carries `rs_exp_<key> = <variant>`, and one
+`rs_exposure` event is sent at that moment, so a session with no later
+gameplay still counts. A new session (on mobile, after `session_timeout`)
+starts untagged until its own first read. An experiment that is gone from a
+later fetch is no longer tagged. A well-formed `rs_exp_<key>` your game
+sets itself is left alone. Tags are added when an event is queued, so an
+event sent later from the saved queue keeps its variant. A fresh config response
 uses one ordinary event; an unchanged ETag response is free. Keep safe defaults
 in the game for its first launch and offline play.
 

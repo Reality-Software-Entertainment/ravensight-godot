@@ -135,19 +135,24 @@ signal event_tracked(event_name: String, data: Dictionary)
 const MAX_BATCH_SIZE: int = 50          # server hard limit on /track/batch
 const DEFAULT_RETRY_SECONDS: float = 10.0
 const MAX_BACKOFF_SECONDS: float = 300.0  # cap exponential backoff at 5 min
-## Backoff waits are spread by plus or minus this fraction, so many games
-## that failed together do not retry together. Retry-After is never spread.
-const JITTER: float = 0.2
+## Backoff waits are multiplied by a random factor of at least this and
+## below 1, so many games that failed together do not retry together.
+## Retry-After is never spread.
+const JITTER_MIN_FACTOR: float = 0.5
 ## The largest event the API accepts, measured as the server measures it:
 ## the JSON of the event's data. Bigger events are dropped before queueing.
 const MAX_EVENT_BYTES: int = 8192
 const MAX_DISTRIBUTION_LENGTH: int = 40
 const CONSENT_OPT_OUT := "opt_out"
 const CONSENT_OPT_IN := "opt_in"
+## 400 answers about one event that carry no index: the batch is halved
+## until that event is alone, rather than dropping the whole request.
+const PER_EVENT_400: Array[String] = ["event_too_large", "event_name_too_long", "missing_event", "invalid_event_data", "invalid_event_id"]
 ## Every request gives up after this long and counts as offline.
 const REQUEST_TIMEOUT_SECONDS: float = 15.0
-## A batch 401 reopens the session at most this many times in a row.
-const MAX_REAUTH_ATTEMPTS: int = 2
+## A batch 401 reopens the session at most this many times in a row; the
+## next 401 in a row waits for the backoff.
+const MAX_REAUTH_ATTEMPTS: int = 1
 ## The categories the feedback endpoint accepts. Anything else is refused
 ## before it is sent.
 const FEEDBACK_CATEGORIES: Array[String] = ["bug", "suggestion", "complaint", "praise", "playtest", "other"]
@@ -233,6 +238,27 @@ func drain() -> Array:
 	out.sort_custom(func(x, y): return x["seq"] < y["seq"])
 	return out
 """
+
+## The persisted queue (docs: delivery contract). One file per ingest key,
+## named by the 64-bit FNV-1a hash of the key, written atomically.
+const QUEUE_DIR: String = "user://ravensight/"
+const QUEUE_FORMAT_VERSION: int = 2
+## The most events kept, across every session's group.
+const QUEUE_MAX_EVENTS: int = 500
+## Events older than this are dropped when the queue is loaded: the server
+## keeps nothing past 90 days.
+const QUEUE_MAX_AGE_MS: int = 89 * 86400 * 1000
+## Request bodies of at least this many bytes are sent gzip compressed.
+const GZIP_MIN_BYTES: int = 1024
+
+## Device fields sent on the session: each at most this many characters.
+const DEVICE_FIELD_MAX_CHARS: int = 128
+
+## Ads and attribution (docs: ads and attribution contract).
+const AD_FORMATS: Array[String] = ["banner", "interstitial", "rewarded", "native", "app_open", "other"]
+const AD_RESULTS: Array[String] = ["shown", "clicked", "failed", "rewarded"]
+## Present once this install has sent its attribution event.
+const ATTRIBUTION_SENT_PATH: String = "user://ravensight_attribution.save"
 
 const DEVICE_ID_PATH: String = "user://device_id.save"
 ## Present only while the player has opted out (see set_tracking_enabled).
@@ -338,6 +364,33 @@ var _status_reason: String = ""
 ## "session_failed". get_status_reason() reports it when nothing worse holds.
 var _transient_reason: String = ""
 var _logged_once: Dictionary = {}
+
+## The open session's `origin` from the /session answer, stored exactly as
+## received, or {}. Every event queued under the session keeps a reference
+## to it, so an event sent by a later session can say where it came from.
+var _session_origin: Dictionary = {}
+## The open session's signing secret, in memory only, or "".
+var _signing_secret: String = ""
+## Seconds to add to the device clock for a signature timestamp, measured
+## from the session answer's serverTime.
+var _clock_offset: int = 0
+## True once the persisted queue has been read this run.
+var _queue_loaded: bool = false
+## True while a deferred queue write is scheduled.
+var _queue_write_scheduled: bool = false
+## Set by a 415 (or a 413 for one compressed event): the next batch is sent
+## uncompressed, once.
+var _send_plain: bool = false
+## Events at the queue's front in the batch in flight.
+var _inflight_size: int = 0
+## Whether the last batch went gzip compressed.
+var _last_batch_compressed: bool = false
+## Events the SDK let go of, by reason. See get_delivery_stats().
+var _delivery_stats: Dictionary = {"dropped_overflow": 0, "dropped_too_old": 0, "dropped_refused": 0}
+## Experiments this session has used, key to variant (see get_config()).
+var _exposed: Dictionary = {}
+## Compiled once: the characters JSON must escape.
+var _json_control: RegEx = null
 
 ## --- Quit handling --------------------------------------------------------------
 
@@ -487,7 +540,7 @@ func _ready() -> void:
 	if _player_opted_out:
 		# Nothing leaves the device, not even the settings check, and
 		# anything an earlier autoload tracked is dropped.
-		_clear_queue()
+		_clear_queue(true)
 		if _consent_mode() == CONSENT_OPT_IN:
 			print("Ravensight: waiting for the player to opt in (consent = \"opt_in\")")
 		else:
@@ -523,6 +576,7 @@ func _activate(at_boot: bool = false) -> void:
 	if not _is_ready or not _is_active():
 		return
 	_update_reason()
+	_load_queue()
 	_queue_game_started(at_boot)
 	if not _settings_checked:
 		_check_server_settings()
@@ -545,6 +599,10 @@ func _take_over_quit() -> void:
 		_owns_go_back_quit = true
 
 func _exit_tree() -> void:
+	# Errors the logger buffered are queued, then the queue is saved for the
+	# next launch.
+	_drain_error_logger()
+	_persist_queue()
 	_uninstall_error_logger()
 
 func _notification(what: int) -> void:
@@ -598,6 +656,7 @@ func _flush_then_quit(exit_code: int) -> void:
 	_quit_exit_code = exit_code
 	_send_health_once()
 	_queue_game_exited()
+	_persist_queue()
 	if not _is_ready or not _is_active() or pending_events.is_empty():
 		_finish_quit()
 		return
@@ -648,6 +707,8 @@ func _on_backgrounded() -> void:
 	_backgrounded_at = _unix_now()
 	_backgrounded_at_ms = _unix_now_ms()
 	_send_health_once()
+	# The app may be killed in the background without another word.
+	_persist_queue()
 	_flush_pending(true)
 	if playtest_token.is_empty() and not session_token.is_empty():
 		_write_text(BACKGROUND_MARKER_PATH, JSON.stringify({
@@ -655,6 +716,7 @@ func _on_backgrounded() -> void:
 			"expiresAt": session_expires_at,
 			"backgroundedAt": _backgrounded_at,
 			"backgroundedAtMs": _backgrounded_at_ms,
+			"origin": _session_origin,
 		}))
 
 ## Back in the foreground. Under session_timeout nothing happens. At or past
@@ -674,8 +736,11 @@ func _on_foregrounded() -> void:
 		return
 	_queue_game_exited(_backgrounded_at_ms)
 	# Everything queued so far belongs to the old session; once it is
-	# delivered the session is dropped and a new one opens.
+	# delivered the session is dropped and a new one opens. What is queued
+	# from now on joins the new session, not the old one's origin.
 	_session_boundary = pending_events.size()
+	_session_origin = {}
+	_reset_session_scope()
 	_health_sent = false
 	_fps_samples.clear()
 	_fps_next = 0
@@ -703,10 +768,17 @@ func _send_exit_marker_if_any() -> void:
 	var token := str(marker.get("sessionToken", ""))
 	var expires_at := int(marker.get("expiresAt", 0))
 	var backgrounded_at := int(marker.get("backgroundedAt", 0))
-	if token.is_empty() or backgrounded_at <= 0 or _unix_now() >= expires_at:
-		return
 	# A marker from before milliseconds holds seconds, which the server still reads.
 	var exited_at := int(marker.get("backgroundedAtMs", backgrounded_at))
+	var origin = marker.get("origin")
+	if origin is Dictionary and not origin.is_empty() and backgrounded_at > 0:
+		# Queued like any event and sent under this run's session with the
+		# old session's origin, so it is retried and signed like the rest.
+		if _enqueue("game_exited", {}, exited_at) != null:
+			pending_events[-1]["_origin"] = origin
+		return
+	if token.is_empty() or backgrounded_at <= 0 or _unix_now() >= expires_at:
+		return
 	var body := JSON.stringify({"events": [{"event": "game_exited", "data": {}, "timestamp": exited_at}]})
 	_send("POST", "/track/batch", ["Content-Type: application/json", "X-Session-Token: " + token], body, _ignore_response)
 
@@ -832,6 +904,134 @@ func _remove_file(user_path: String) -> void:
 	var p := _path(user_path)
 	if FileAccess.file_exists(p):
 		DirAccess.remove_absolute(p)
+
+## --- Persisted queue --------------------------------------------------------------
+
+## True when the queue is kept on disk: a real player's run with a key. A
+## playtest run keeps its throwaway queue in memory only.
+func _persist_enabled() -> bool:
+	return playtest_token.is_empty() and not ingest_key.strip_edges().is_empty()
+
+## This key's queue file: queue-<16 hex>.json, the hex being the 64-bit
+## FNV-1a hash of the key's UTF-8 bytes. It separates keys; it is no secret.
+func _queue_path() -> String:
+	return QUEUE_DIR + "queue-%s.json" % fnv1a64_hex(ingest_key.strip_edges())
+
+## 64-bit FNV-1a of the UTF-8 bytes of `text`, as 16 lowercase hex
+## characters. Computed in two 32-bit halves, so no step overflows.
+static func fnv1a64_hex(text: String) -> String:
+	var hi := 0xcbf29ce4
+	var lo := 0x84222325
+	for b in text.to_utf8_buffer():
+		lo = lo ^ b
+		# Multiply by the prime 0x100000001b3 modulo 2^64.
+		var lo_product := lo * 0x1b3
+		hi = (hi * 0x1b3 + lo * 0x100 + (lo_product >> 32)) & 0xffffffff
+		lo = lo_product & 0xffffffff
+	return "%08x%08x" % [hi, lo]
+
+## Saves the queue at the end of this frame, once however many events were
+## queued in it.
+func _schedule_persist() -> void:
+	if _queue_write_scheduled or not _queue_loaded or not _persist_enabled():
+		return
+	_queue_write_scheduled = true
+	call_deferred("_persist_queue")
+
+## Writes the queue now: format version 2, one group per session with that
+## session's origin as received, written to a temporary file and renamed
+## over the old one so a partial file never replaces a good one. An empty
+## queue deletes the file. Only while sending is allowed (or `stopping`,
+## the last write before the queue is let go of in memory) and the file has
+## been read, so a stopped run never overwrites what the next launch needs.
+func _persist_queue(stopping: bool = false) -> void:
+	_queue_write_scheduled = false
+	if not _queue_loaded or not _persist_enabled() or not (stopping or _is_active()):
+		return
+	var path := _queue_path()
+	if pending_events.is_empty():
+		_remove_file(path)
+		return
+	var groups: Array = []
+	var last_session = null
+	for e in pending_events:
+		var origin = e.get("_origin")
+		if not (origin is Dictionary):
+			origin = {}
+		var session := str(origin.get("session", ""))
+		if groups.is_empty() or session != last_session:
+			var group := {"events": []}
+			if not origin.is_empty():
+				group["origin"] = origin
+			groups.append(group)
+			last_session = session
+		groups[-1]["events"].append({"event": e["event"], "timestamp": e["timestamp"], "data": e.get("data", {})})
+	DirAccess.make_dir_recursive_absolute(_path(QUEUE_DIR))
+	var tmp := path + ".tmp"
+	var file := FileAccess.open(_path(tmp), FileAccess.WRITE)
+	if file == null:
+		return
+	file.store_string(_json({"version": QUEUE_FORMAT_VERSION, "groups": groups}))
+	file.close()
+	if DirAccess.rename_absolute(_path(tmp), _path(path)) != OK:
+		_remove_file(tmp)
+
+## Reads the queue once, when sending starts: its events go ahead of
+## anything queued this run. A missing, unreadable, malformed or unknown
+## version file is an empty queue. Version 1 groups have no origin. Events
+## older than QUEUE_MAX_AGE_MS are dropped (dropped_too_old), and the oldest
+## past the cap (dropped_overflow).
+func _load_queue() -> void:
+	if _queue_loaded:
+		return
+	_queue_loaded = true
+	if not _persist_enabled():
+		return
+	var doc = _parse_json(_read_text(_queue_path()).to_utf8_buffer())
+	var version = doc.get("version") if doc is Dictionary else null
+	if not ((version is int or version is float) and (int(version) == 1 or int(version) == 2)) or not (doc.get("groups") is Array):
+		_persist_queue()
+		return
+	var cutoff := _unix_now_ms() - QUEUE_MAX_AGE_MS
+	var loaded: Array = []
+	var too_old := 0
+	for group in doc["groups"]:
+		if not (group is Dictionary) or not (group.get("events") is Array):
+			continue
+		var origin = group.get("origin") if int(version) == 2 else null
+		if not (origin is Dictionary):
+			origin = {}
+		for ev in group["events"]:
+			if not (ev is Dictionary) or not (ev.get("event") is String) or str(ev["event"]).is_empty():
+				continue
+			var ts = ev.get("timestamp")
+			if not (ts is int or ts is float):
+				continue
+			var timestamp := int(ts)
+			# A timestamp below 10^12 is in seconds (an older SDK's queue).
+			var timestamp_ms := timestamp if timestamp >= 1000000000000 else timestamp * 1000
+			if timestamp_ms < cutoff:
+				too_old += 1
+				continue
+			var data = ev.get("data")
+			loaded.append({"event": ev["event"], "data": data if data is Dictionary else {}, "timestamp": timestamp, "_origin": origin})
+	_delivery_stats["dropped_too_old"] += too_old
+	pending_events = loaded + pending_events
+	if _session_boundary > 0:
+		_session_boundary += loaded.size()
+	_trim_queue()
+	if not pending_events.is_empty() and _first_queued_at < 0.0:
+		_first_queued_at = _now()
+	# Saves what was dropped and anything an earlier autoload queued.
+	_persist_queue()
+
+## Events the SDK let go of since launch, by reason: "dropped_overflow"
+## (past the 500 event cap, oldest first), "dropped_too_old" (older than 89
+## days when the queue was read) and "dropped_refused" (refused by the
+## server with a 400 or after a 413 or 415). Events the server stores fewer
+## of than were sent (accepted lower than sent) are not counted here.
+func get_delivery_stats() -> Dictionary:
+	return _delivery_stats.duplicate()
 
 ## --- Clocks and transport (replaced in tests) -------------------------------------
 
@@ -1007,6 +1207,7 @@ func set_playtest_context(ctx: Dictionary) -> void:
 		"pt_tier": str(ctx.get("tier", "T2_driven_build")),
 	}
 
+	_reset_session_scope()
 	var had_session := not session_token.is_empty() or _session_request_pending
 	if had_session:
 		# Dropping bumps the generation, so a response for the old identity
@@ -1093,7 +1294,36 @@ func _start_session(explicit: bool = false) -> void:
 	}
 	if not _distribution.is_empty():
 		session_body["distribution"] = _distribution
-	_send("POST", "/session", headers, JSON.stringify(session_body), _on_session_response.bind(generation))
+	var device := _device_fields()
+	if not device.is_empty():
+		session_body["device"] = device
+	_send("POST", "/session", headers, _json(session_body), _on_session_response.bind(generation))
+
+## The device fields sent on the session: model, OS version and GPU name,
+## each only when the engine reports it without a permission prompt. No
+## hardware identifier is ever read. Values are trimmed, printable and at
+## most DEVICE_FIELD_MAX_CHARS characters; an empty one is left out.
+func _device_fields() -> Dictionary:
+	var raw := _device_raw()
+	var out := {}
+	for key in ["model", "osVersion", "gpu"]:
+		var value := _clean_device_field(str(raw.get(key, "")))
+		if not value.is_empty():
+			out[key] = value
+	return out
+
+## What the engine reports. Replaced in tests.
+func _device_raw() -> Dictionary:
+	var model := OS.get_model_name()
+	# Desktop platforms answer a placeholder, which says nothing.
+	if model == "GenericDevice":
+		model = ""
+	return {"model": model, "osVersion": OS.get_version(), "gpu": RenderingServer.get_video_adapter_name()}
+
+func _clean_device_field(value: String) -> String:
+	var control := RegEx.new()
+	control.compile("[\\x00-\\x1f\\x7f]")
+	return control.sub(value, "", true).strip_edges().left(DEVICE_FIELD_MAX_CHARS).strip_edges()
 
 func _on_session_response(code: int, headers: PackedStringArray, body: PackedByteArray, generation: int) -> void:
 	# A newer session attempt has started (or the session was dropped) since
@@ -1112,6 +1342,7 @@ func _on_session_response(code: int, headers: PackedStringArray, body: PackedByt
 			var expires_in := int(parsed.get("expiresIn", 86400))
 			session_expires_at = _unix_now() + expires_in
 			_apply_error_capture_settings(parsed, false)
+			_adopt_session_extras(parsed)
 			_backoff_seconds = DEFAULT_RETRY_SECONDS
 			# A success ends any wait an explicit flush cut short.
 			_stop_retry()
@@ -1157,20 +1388,41 @@ func _on_session_response(code: int, headers: PackedStringArray, body: PackedByt
 	if _quitting and code != 201:
 		_finish_quit()
 
+## Keeps the session answer's origin and signing secret. The origin is
+## stored exactly as received; events queued while no session was open
+## belong to this one. The secret stays in memory only.
+func _adopt_session_extras(answer: Dictionary) -> void:
+	var origin = answer.get("origin")
+	_session_origin = origin if origin is Dictionary else {}
+	var signing = answer.get("signing")
+	_signing_secret = ""
+	if signing is Dictionary and str(signing.get("algorithm", "")) == "HMAC-SHA256" and int(signing.get("version", 0)) == 1 and signing.get("secret") is String:
+		_signing_secret = signing["secret"]
+		var server_time = signing.get("serverTime")
+		_clock_offset = int(server_time) - _unix_now() if (server_time is int or server_time is float) else 0
+	if not _session_origin.is_empty():
+		var adopted := false
+		for e in pending_events:
+			if not e.has("_origin"):
+				e["_origin"] = _session_origin
+				adopted = true
+		if adopted:
+			_persist_queue()
+
 ## --- Retry / backoff ------------------------------------------------------------
 
 ## Waits before the next automatic attempt: `server_wait_seconds` exactly
 ## when the server gave one (Retry-After), otherwise the backoff, which
-## starts at 10 seconds and doubles up to 5 minutes, spread by plus or
-## minus JITTER (never past 5 minutes).
+## starts at 10 seconds and doubles up to 5 minutes, multiplied by a random
+## factor in [JITTER_MIN_FACTOR, 1).
 func _schedule_retry(server_wait_seconds: float = -1.0) -> void:
 	var wait := _backoff_seconds
 	if server_wait_seconds >= 0.0:
 		wait = server_wait_seconds
 		_retry_from_server = true
 	else:
-		var factor := 1.0 - JITTER + 2.0 * JITTER * _random()
-		wait = minf(_backoff_seconds * factor, MAX_BACKOFF_SECONDS)
+		var factor := JITTER_MIN_FACTOR + (1.0 - JITTER_MIN_FACTOR) * _random()
+		wait = minf(_backoff_seconds, MAX_BACKOFF_SECONDS) * factor
 		_backoff_seconds = minf(_backoff_seconds * 2.0, MAX_BACKOFF_SECONDS)
 		_retry_from_server = false
 	_retry_at = _now() + wait
@@ -1270,7 +1522,13 @@ func _cached_config() -> Dictionary:
 
 ## No type coercion, except JSON numbers support both int and float defaults.
 ## Integer defaults accept only whole numbers within the exact JSON range.
+##
+## A read is how the game uses a value, so the first read in a session marks
+## every running experiment in the config as exposed: from then on every
+## event queued this session carries rs_exp_<key> = <variant>, and one
+## rs_exposure event is sent at that moment. A fetch alone tags nothing.
 func get_config(key: String, fallback: Variant) -> Variant:
+	_note_exposure()
 	var values: Dictionary = _cached_config().get("values", {})
 	if not values.has(key):
 		return fallback
@@ -1311,6 +1569,182 @@ func _on_config_response(code: int, _headers: PackedStringArray, body: PackedByt
 			if playtest_token.is_empty():
 				_write_text(CONFIG_PATH, JSON.stringify({"scope": scope, "document": parsed}))
 	config_ready.emit(source)
+
+## --- Experiment exposure ---------------------------------------------------------
+
+const _EXPERIMENT_KEY_PATTERN := "^[a-z][a-z0-9_]{0,63}$"
+const _VARIANT_PATTERN := "^[a-z][a-z0-9_-]{0,39}$"
+
+## Marks every experiment in the current config as exposed for this
+## session, and sends one rs_exposure event when any was not yet.
+func _note_exposure() -> void:
+	if not _is_active():
+		return
+	var newly := false
+	for assignment in _cached_config().get("experiments", []):
+		if not _exposed.has(assignment["key"]):
+			_exposed[assignment["key"]] = assignment["variant"]
+			newly = true
+	if newly:
+		track_event("rs_exposure", {})
+
+## Adds rs_exp_<key> = <variant> for each exposed experiment still in the
+## config (one that stopped is no longer tagged). A well-formed value the
+## game set itself is left alone; a malformed one is replaced.
+func _apply_exposure_tags(event_data: Dictionary) -> void:
+	if _exposed.is_empty():
+		return
+	for assignment in _cached_config().get("experiments", []):
+		var key: String = assignment["key"]
+		if not _exposed.has(key):
+			continue
+		var tag := "rs_exp_" + key
+		if event_data.has(tag) and _config_matches(_VARIANT_PATTERN, event_data[tag]):
+			continue
+		event_data[tag] = assignment["variant"]
+
+## --- Ads and attribution ------------------------------------------------------------
+
+## One ad lifecycle step as an `ad` event (default name "rs_ad").
+## `network` is the network that served the ad (1 to 64 characters),
+## `format` one of AD_FORMATS, `result` one of AD_RESULTS. `options`:
+## placement (1 to 100 characters), revenue_micros and currency (revenue on
+## "shown" only), data, event_name. Revenue is whole MICROS of the currency
+## (1,000,000 is one major unit) as a digit string of 1 to 18 digits, or a
+## non-negative int; never a float: convert a mediation callback's double
+## with micros_from_revenue(). Returns false, and sends nothing, when
+## anything is malformed, including revenue without a currency.
+func track_ad(network: String, format: String, result: String, options: Dictionary = {}) -> bool:
+	var props := _typed_base(options)
+	props["rs_kind"] = "ad"
+	if network.strip_edges().is_empty() or _utf16_length(network) > 64 or not AD_FORMATS.has(format) or not AD_RESULTS.has(result):
+		return _refuse_typed("ad", "network is 1 to 64 characters, format one of %s and result one of %s" % [AD_FORMATS, AD_RESULTS])
+	props["rs_ad_network"] = network
+	props["rs_ad_format"] = format
+	props["rs_ad_result"] = result
+	var placement = options.get("placement")
+	if placement != null and not str(placement).is_empty():
+		if _utf16_length(str(placement)) > 100:
+			return _refuse_typed("ad", "placement is at most 100 characters")
+		props["rs_ad_placement"] = str(placement)
+	var revenue = options.get("revenue_micros")
+	var currency = options.get("currency")
+	if revenue != null:
+		var micros := _micros_text(revenue)
+		if micros.is_empty():
+			return _refuse_typed("ad", "revenue_micros is a digit string of 1 to 18 digits, never a float")
+		if result != "shown":
+			return _refuse_typed("ad", "revenue goes on a shown ad only")
+		if currency == null or not _config_matches("^[A-Za-z]{3}$", currency):
+			return _refuse_typed("ad", "revenue needs a three letter currency")
+		props["rs_revenue_micros"] = micros
+		props["rs_currency"] = str(currency).to_upper()
+	elif currency != null:
+		return _refuse_typed("ad", "a currency is sent only with revenue")
+	track_event(str(options.get("event_name", "rs_ad")), props)
+	return true
+
+## A paid impression: track_ad() with result "shown".
+func track_ad_revenue(network: String, format: String, placement: String, revenue_micros: Variant, currency: String, options: Dictionary = {}) -> bool:
+	var merged := options.duplicate()
+	merged["placement"] = placement
+	merged["revenue_micros"] = revenue_micros
+	merged["currency"] = currency
+	return track_ad(network, format, "shown", merged)
+
+## Micros from decimal text in major units, worked on the digits so no
+## float is ever multiplied: "0.0015" is "1500", "1.23456789" is "1234568"
+## (half up at the seventh decimal). "" for anything that is not a plain
+## non-negative decimal or does not fit 18 digits.
+static func micros_from_decimal_string(text: String) -> String:
+	var t := text.strip_edges()
+	var regex := RegEx.new()
+	regex.compile("^([0-9]*)(?:\\.([0-9]*))?$")
+	var m := regex.search(t)
+	if m == null or (m.get_string(1).is_empty() and m.get_string(2).is_empty()):
+		return ""
+	var whole := m.get_string(1)
+	var fraction := m.get_string(2) + "0000000"
+	var digits := whole + fraction.substr(0, 6)
+	var round_up := fraction.unicode_at(6) >= "5".unicode_at(0)
+	# Strip leading zeros, keeping one.
+	while digits.length() > 1 and digits.begins_with("0"):
+		digits = digits.substr(1)
+	if round_up:
+		var chars := digits.to_utf8_buffer()
+		var i := chars.size() - 1
+		while i >= 0:
+			if chars[i] == 57:
+				chars[i] = 48
+				i -= 1
+			else:
+				chars[i] += 1
+				break
+		digits = chars.get_string_from_utf8()
+		if i < 0:
+			digits = "1" + digits
+	if digits.length() > 18:
+		return ""
+	return digits
+
+## Micros from a mediation callback's revenue double in major units: the
+## double is formatted to 6 decimals by the engine's decimal formatter, then
+## converted with micros_from_decimal_string(). "" for a negative, infinite
+## or NaN value.
+static func micros_from_revenue(value: float) -> String:
+	if is_nan(value) or is_inf(value) or value < 0.0:
+		return ""
+	return micros_from_decimal_string(String.num(value, 6))
+
+func _micros_text(value: Variant) -> String:
+	if value is int:
+		return str(value) if value >= 0 and str(value).length() <= 18 else ""
+	if value is String and _config_matches("^[0-9]{1,18}$", value):
+		return value
+	return ""
+
+## Where this device was acquired, sent once per install as an
+## `attribution` event (default name "rs_attribution"). `attribution`:
+## source (required, 1 to 64 characters: "utm", "store_referrer",
+## "organic" or a partner name), network (1 to 100), campaign, adset,
+## creative (1 to 200 each), touch_time (epoch milliseconds), event_name.
+## Empty fields are left out. Returns true when queued; false when it was
+## already sent for this install (a "sent" flag is saved beside the device
+## id), the SDK is not tracking, or a field is malformed.
+func set_attribution(attribution: Dictionary) -> bool:
+	if not _is_active() or FileAccess.file_exists(_path(ATTRIBUTION_SENT_PATH)):
+		return false
+	var props := {"rs_kind": "attribution"}
+	var source := str(attribution.get("source", "")).strip_edges()
+	if source.is_empty() or _utf16_length(source) > 64:
+		return _refuse_typed("attribution", "source is 1 to 64 characters")
+	props["rs_attr_source"] = source
+	for field in [["network", "rs_attr_network", 100], ["campaign", "rs_campaign", 200], ["adset", "rs_adset", 200], ["creative", "rs_creative", 200]]:
+		var value = attribution.get(field[0])
+		if value == null or str(value).is_empty():
+			continue
+		if _utf16_length(str(value)) > field[2]:
+			return _refuse_typed("attribution", "%s is at most %d characters" % [field[0], field[2]])
+		props[field[1]] = str(value)
+	var touch = attribution.get("touch_time")
+	if touch != null:
+		if not (touch is int) or touch < 0 or touch > 9007199254740991:
+			return _refuse_typed("attribution", "touch_time is whole epoch milliseconds")
+		props["rs_touch_time"] = touch
+	track_event(str(attribution.get("event_name", "rs_attribution")), props)
+	if playtest_token.is_empty():
+		_write_text(ATTRIBUTION_SENT_PATH, "1")
+	return true
+
+func _refuse_typed(kind: String, why: String) -> bool:
+	push_warning("Ravensight: %s event not sent: %s" % [kind, why])
+	return false
+
+## This install's random device id, "" before one exists. Pass it to an
+## attribution partner as its customer user id so install callbacks name the
+## same device.
+func get_device_id() -> String:
+	return device_id
 
 ## --- Typed events ---------------------------------------------------------------
 ##
@@ -1633,8 +2067,11 @@ func _trail_text() -> String:
 func _is_captured_error(data: Dictionary) -> bool:
 	return str(data.get("rs_kind", "")) == "error" and data.has("rs_source") and str(data["rs_source"]) != "manual"
 
+## The first queued automatic error outside the batch in flight, or -1. The
+## batch in flight is the queue's front and is removed by count when it is
+## answered, so nothing inside it may move.
 func _first_captured_error_index() -> int:
-	for i in pending_events.size():
+	for i in range(_inflight_size if _flush_in_progress else 0, pending_events.size()):
 		var d = pending_events[i].get("data")
 		if d is Dictionary and _is_captured_error(d):
 			return i
@@ -1907,7 +2344,7 @@ func set_tracking_enabled(value: bool) -> void:
 
 	if _player_opted_out:
 		_drop_session()
-		_clear_queue()
+		_clear_queue(true)
 		_stop_retry()
 		print("Ravensight: tracking disabled by player opt-out")
 		_update_reason()
@@ -1941,17 +2378,26 @@ func reset_device_id() -> String:
 		return device_id
 	if _no_key:
 		return device_id
+	# A new identity is a new install for attribution and a new session.
+	_remove_file(ATTRIBUTION_SENT_PATH)
+	_reset_session_scope()
 	if _consent_mode() == CONSENT_OPT_IN and _player_opted_out:
 		_remove_file(DEVICE_ID_PATH)
 		device_id = ""
 		_drop_session()
-		_clear_queue()
+		_clear_queue(true)
 		return ""
 	device_id = _generate_device_id()
 	_write_text(DEVICE_ID_PATH, device_id)
 	_drop_session()
-	_clear_queue()
+	_clear_queue(true)
+	if _is_ready and _is_active():
+		_load_queue()
 	return device_id
+
+## Starts experiment exposure over for a new session.
+func _reset_session_scope() -> void:
+	_exposed.clear()
 
 ## Ends the current session without touching the queue. Bumping the request
 ## generation makes _on_session_response() ignore any session request still
@@ -1959,6 +2405,8 @@ func reset_device_id() -> String:
 func _drop_session() -> void:
 	session_token = ""
 	session_expires_at = 0
+	_session_origin = {}
+	_signing_secret = ""
 	_session_request_pending = false
 	_session_request_generation += 1
 	_config_generation += 1
@@ -1966,17 +2414,26 @@ func _drop_session() -> void:
 	_config_document = {}
 	_config_scope = ""
 
-## Discards every queued event. Bumping _queue_generation makes the response
-## to any batch still in flight a no-op (see _on_batch_response()), and the
-## in-flight flag is released so events queued from now on can go out without
-## waiting for that stale answer.
-func _clear_queue() -> void:
+## Discards every queued event from memory. Bumping _queue_generation makes
+## the response to any batch still in flight a no-op (see
+## _on_batch_response()), and the in-flight flag is released so events
+## queued from now on can go out without waiting for that stale answer.
+## `forget` also deletes the persisted queue (the player's opt-out, a reset
+## identity); otherwise the file stays for the next launch and is read again
+## if this run starts sending later.
+func _clear_queue(forget: bool = false) -> void:
+	if not forget and _queue_loaded:
+		# Keep what this run queued (a write may still be scheduled).
+		_persist_queue(true)
 	pending_events.clear()
 	_queue_generation += 1
 	_flush_in_progress = false
 	_split_batch_size = 0
 	_session_boundary = 0
 	_first_queued_at = -1.0
+	_queue_loaded = false
+	if forget and _persist_enabled():
+		_remove_file(_queue_path())
 
 ## The kill switch is off (settings said so, or a 403 tracking_disabled):
 ## final for the rest of the run. Nothing is queued, sent or retried.
@@ -2033,12 +2490,12 @@ func _enqueue_and_emit(event_name: String, data: Dictionary, timestamp: int = -1
 
 ## Queues the event and returns the data dictionary actually stored (a copy
 ## carrying rs_event_id, plus the playtest tags in a playtest run), or null
-## when the data is over MAX_EVENT_BYTES as JSON and the event was dropped.
+## when the data is over MAX_EVENT_BYTES as the server measures it and the
+## event was dropped.
 func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_front: bool = false):
 	# Never mutate the caller's dictionary.
 	var event_data := data.duplicate()
-	for assignment in _cached_config().get("experiments", []):
-		event_data["rs_exp_" + assignment["key"]] = assignment["variant"]
+	_apply_exposure_tags(event_data)
 	if not playtest_token.is_empty():
 		event_data.merge(_playtest_tags, true)
 	if not device_id.is_empty():
@@ -2048,38 +2505,106 @@ func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_fron
 		flush_failed.emit("event_too_large")
 		return null
 
-	while not pending_events.is_empty() and pending_events.size() >= max_queue_size:
-		# Automatic error captures go first, so they never cost the game a
-		# gameplay event; with none queued, a new capture is itself dropped.
+	# Full: an automatic error goes first, so a storm of them can never push
+	# gameplay out; an automatic error never evicts a gameplay event, it is
+	# dropped itself.
+	var automatic := _is_captured_error(event_data)
+	while not pending_events.is_empty() and pending_events.size() >= _queue_cap():
 		var error_index := _first_captured_error_index()
-		if error_index >= 0:
-			_remove_queued(error_index)
-		elif _is_captured_error(event_data):
+		_delivery_stats["dropped_overflow"] += 1
+		if error_index < 0 and automatic:
 			return null
-		# Drop the oldest, but keep a queued game_started at the front.
-		elif pending_events.size() > 1 and str(pending_events[0].get("event", "")) == "game_started":
-			_remove_queued(1)
-		else:
-			_remove_queued(0)
+		_remove_queued(error_index if error_index >= 0 else _oldest_droppable_index())
 
 	var event := {
 		"event": event_name,
 		"data": event_data,
 		"timestamp": timestamp if timestamp >= 0 else _unix_now_ms(),
 	}
+	# The session it was queued under, so a later session can send it with
+	# its origin. Events queued before a session opens join the next one.
+	if not _session_origin.is_empty():
+		event["_origin"] = _session_origin
 	if at_front:
+		# This run's game_started: never dropped to make room.
+		event["_keep"] = true
 		pending_events.push_front(event)
 		if _session_boundary > 0:
+			_session_boundary += 1
+	elif not automatic and _first_captured_error_index() >= 0:
+		# Gameplay events keep their place ahead of automatic errors.
+		var at := _first_captured_error_index()
+		pending_events.insert(at, event)
+		if at < _session_boundary:
 			_session_boundary += 1
 	else:
 		pending_events.append(event)
 	if _first_queued_at < 0.0:
 		_first_queued_at = _now()
+	_schedule_persist()
 	return event_data
 
-## The serialized size of an event's data, as the server measures it.
+## The queue cap: max_queue_size, at most QUEUE_MAX_EVENTS.
+func _queue_cap() -> int:
+	return clampi(max_queue_size, 1, QUEUE_MAX_EVENTS)
+
+## The oldest event that may make room: not this run's game_started.
+func _oldest_droppable_index() -> int:
+	var index := 0
+	while index < pending_events.size() - 1 and pending_events[index].get("_keep", false):
+		index += 1
+	return index
+
+## Drops events past the queue cap, automatic errors first, then the oldest
+## (keeping this run's game_started), and counts them.
+func _trim_queue() -> void:
+	while pending_events.size() > _queue_cap():
+		var error_index := _first_captured_error_index()
+		_remove_queued(error_index if error_index >= 0 else _oldest_droppable_index())
+		_delivery_stats["dropped_overflow"] += 1
+
+## An error event's text fields and the length within which each counts one
+## byte a character toward the 8 KB ceiling (delivery contract, section 6,
+## which defers to the errors contract for the cuts).
+const ERROR_TEXT_CAPS := {"rs_message": 200, "rs_stack": 2000, "rs_trail": 1500}
+
+## The serialized size of an event's data, as the server measures it: the
+## UTF-8 bytes of its JSON, except that an error event's rs_message, rs_stack
+## and rs_trail, each within its cap, count one byte a character, so
+## escaping never pushes an allowed text over the limit.
 func _event_bytes(data: Dictionary) -> int:
-	return JSON.stringify(data).to_utf8_buffer().size()
+	var size := _json(data).to_utf8_buffer().size()
+	if str(data.get("rs_kind", "")) != "error":
+		return size
+	for key in ERROR_TEXT_CAPS:
+		var value = data.get(key)
+		var cap: int = ERROR_TEXT_CAPS[key]
+		if value is String and _utf16_length(value) <= cap:
+			size -= _json(value).to_utf8_buffer().size() - _utf16_length(value)
+	return size
+
+## Characters as the server counts them: UTF-16 code units.
+func _utf16_length(text: String) -> int:
+	return text.to_utf16_buffer().size() / 2
+
+## JSON text the server can parse. GDScript's JSON.stringify writes most
+## control characters raw, which is not valid JSON; they are escaped here.
+## Raw control characters can only occur inside strings, so this never
+## changes the structure.
+func _json(value: Variant) -> String:
+	var text := JSON.stringify(value)
+	if _json_control == null:
+		_json_control = RegEx.new()
+		_json_control.compile("[\\x00-\\x1f]")
+	if _json_control.search(text) == null:
+		return text
+	var out := ""
+	var last := 0
+	for m in _json_control.search_all(text):
+		out += text.substr(last, m.get_start() - last)
+		out += "\\u%04x" % m.get_string().unicode_at(0)
+		last = m.get_end()
+	return out + text.substr(last)
 
 ## The next rs_event_id: the first 16 characters of the device id, the
 ## launch time in hex, a per-launch nonce of 8 hex characters and a
@@ -2112,11 +2637,14 @@ func _remove_queued(index: int) -> void:
 	if index < _session_boundary:
 		_session_boundary -= 1
 
-## Drops the first `count` queued events (they were delivered or refused).
-## When that finishes the old session's share (see _session_boundary), the
-## session is dropped so the rest opens a new one.
+## Drops the first `count` queued events (they were delivered or refused),
+## and saves the queue before anything else happens, so a crash right after
+## the answer resends as little as possible. When that finishes the old
+## session's share (see _session_boundary), the session is dropped so the
+## rest opens a new one.
 func _drop_front(count: int) -> void:
 	pending_events = pending_events.slice(count, pending_events.size())
+	_persist_queue()
 	if _session_boundary > 0:
 		_session_boundary = maxi(0, _session_boundary - count)
 		if _session_boundary == 0:
@@ -2160,10 +2688,53 @@ func _flush_pending(explicit: bool = false) -> void:
 		batch_size = mini(batch_size, _split_batch_size)
 	if _session_boundary > 0:
 		batch_size = mini(batch_size, _session_boundary)
-	var batch: Array = pending_events.slice(0, batch_size)
-
-	_send("POST", "/track/batch", _session_headers(), JSON.stringify({"events": batch}),
+	_inflight_size = batch_size
+	var wire: Array = []
+	for e in pending_events.slice(0, batch_size):
+		wire.append(_wire_event(e))
+	var body := _json({"events": wire})
+	var headers := _signed_headers(_session_headers(), body)
+	var payload: Variant = _encode_body(body, headers, not _send_plain)
+	_last_batch_compressed = payload is PackedByteArray
+	_send("POST", "/track/batch", headers, payload,
 		_on_batch_response.bind(batch_size, _queue_generation))
+
+## One queued event as it goes on the wire: name, data and timestamp, plus
+## the `origin` of the session it was queued under when that is not the
+## current session (copied verbatim, never rebuilt).
+func _wire_event(e: Dictionary) -> Dictionary:
+	var out := {"event": e["event"], "data": e.get("data", {}), "timestamp": e["timestamp"]}
+	var origin = e.get("_origin")
+	if origin is Dictionary and not origin.is_empty() and str(origin.get("session", "")) != str(_session_origin.get("session", "")):
+		out["origin"] = origin
+	return out
+
+## The headers for a body, signed when the session gave a signing secret:
+## HMAC-SHA256 over "v1:" + timestamp + ":" + the uncompressed body.
+func _signed_headers(headers: Array, body: String) -> Array:
+	if _signing_secret.is_empty():
+		return headers
+	var t := _unix_now() + _clock_offset
+	var out := headers.duplicate()
+	out.append("X-Ravensight-Timestamp: %d" % t)
+	out.append("X-Ravensight-Signature: v1=" + _sign(_signing_secret, t, body))
+	return out
+
+## The lowercase hex HMAC-SHA256 of "v1:<t>:<body>", keyed with the secret's
+## UTF-8 bytes (the secret is used as text, never decoded).
+func _sign(secret: String, t: int, body: String) -> String:
+	return Crypto.new().hmac_digest(HashingContext.HASH_SHA256, secret.to_utf8_buffer(), ("v1:%d:" % t + body).to_utf8_buffer()).hex_encode()
+
+## The body as sent: gzip compressed, with Content-Encoding appended to
+## `headers`, when it is at least GZIP_MIN_BYTES before compression and
+## `compress` is true; otherwise the text unchanged. A signature is always
+## over the uncompressed text.
+func _encode_body(body: String, headers: Array, compress: bool) -> Variant:
+	var bytes := body.to_utf8_buffer()
+	if not compress or bytes.size() < GZIP_MIN_BYTES:
+		return body
+	headers.append("Content-Encoding: gzip")
+	return bytes.compress(FileAccess.COMPRESSION_GZIP)
 
 func _on_batch_response(code: int, headers: PackedStringArray, body: PackedByteArray, batch_size: int, generation: int) -> void:
 	# The queue this batch was taken from has been discarded since it went
@@ -2173,9 +2744,13 @@ func _on_batch_response(code: int, headers: PackedStringArray, body: PackedByteA
 	if generation != _queue_generation:
 		return
 	_flush_in_progress = false
-	var error := _extract_error(body, "")
+	_inflight_size = 0
+	var parsed = _parse_json(body)
+	var error := str(parsed.get("error", "")) if parsed is Dictionary else ""
+	if code != 413 and code != 415:
+		_send_plain = false
 
-	if code == 202 or code == 200:
+	if code >= 200 and code < 300:
 		_drop_front(batch_size)
 		_backoff_seconds = DEFAULT_RETRY_SECONDS
 		_stop_retry()
@@ -2187,14 +2762,15 @@ func _on_batch_response(code: int, headers: PackedStringArray, body: PackedByteA
 		if not pending_events.is_empty():
 			_flush_pending(_quitting)
 	elif code == 401:
-		# The session expired or was revoked. Queued events stay; a fresh
-		# session is opened, at most MAX_REAUTH_ATTEMPTS times in a row,
-		# then the backoff takes over.
+		# The session expired, was revoked or a signature was refused. Queued
+		# events stay; a fresh session (and secret) is opened once, then a
+		# second 401 in a row waits for the backoff.
 		session_token = ""
 		session_expires_at = 0
+		_signing_secret = ""
 		_reauth_attempts += 1
 		if _reauth_attempts <= MAX_REAUTH_ATTEMPTS:
-			push_warning("Ravensight: session invalid or expired, refreshing")
+			push_warning("Ravensight: session refused (%s), opening a new one" % (error if not error.is_empty() else "http_401"))
 			_start_session(_quitting)
 		else:
 			flush_failed.emit(error if not error.is_empty() else "http_401")
@@ -2215,19 +2791,8 @@ func _on_batch_response(code: int, headers: PackedStringArray, body: PackedByteA
 		_update_reason()
 		flush_failed.emit(reason)
 		_schedule_retry(_extract_retry_after(headers))
-	elif code == 400 or code == 413:
-		# The server refuses the whole batch when any event in it violates a
-		# ceiling (400), or when the body is too large (413). Halve until the poison event is isolated, then drop it:
-		# one bloated event must never cost the rest of its batch, and
-		# retrying the identical payload forever would deliver nothing.
-		var reason400 := error if not error.is_empty() else "http_%d" % code
-		if batch_size <= 1:
-			_drop_front(batch_size)
-			_log_once("dropped_400", "Ravensight: dropped one event the server refused (%s)" % reason400, false)
-			flush_failed.emit(reason400)
-		else:
-			_split_batch_size = maxi(1, batch_size / 2)
-			push_warning("Ravensight: batch rejected (%s), splitting to %d" % [reason400, _split_batch_size])
+	elif code == 400 or code == 413 or code == 415:
+		_on_batch_refused(code, error, parsed, batch_size)
 		_flush_pending(_quitting)
 	else:
 		var reason2 := error if not error.is_empty() else ("offline" if code == 0 else "http_%d" % code)
@@ -2245,6 +2810,48 @@ func _on_batch_response(code: int, headers: PackedStringArray, body: PackedByteA
 		var still_sending := _flush_in_progress or _session_request_pending
 		if not still_sending:
 			_finish_quit()
+
+## A 400, 413 or 415 for a batch of `batch_size` events at the queue's front:
+## - a 400 naming an event by `index`: that event is dropped, the rest sent;
+## - 400 batch_too_large or a 413: the batch is halved, and one event that
+##   is still too large is dropped;
+## - a 415 (or a 413 for one compressed event): sent once more uncompressed,
+##   then dropped;
+## - a 400 for one event that carries no index (event_too_large and the
+##   other per-event ceilings): the batch is halved until that event is
+##   alone, then it is dropped;
+## - any other 400: the request's events are dropped.
+## Every dropped event is logged once and counted as dropped_refused.
+func _on_batch_refused(code: int, error: String, parsed: Variant, batch_size: int) -> void:
+	var reason := error if not error.is_empty() else "http_%d" % code
+	var index = parsed.get("index") if parsed is Dictionary else null
+	if code == 400 and (index is int or index is float) and int(index) >= 0 and int(index) < batch_size:
+		_remove_queued(int(index))
+		_persist_queue()
+		_count_refused(1, reason)
+		_split_batch_size = 0
+		return
+	if code == 415 or (code == 413 and batch_size <= 1):
+		# A 413 for one event that went uncompressed is never retried as is.
+		if not _send_plain and (code == 415 or _last_batch_compressed):
+			_send_plain = true
+			return
+		_send_plain = false
+		_drop_front(batch_size)
+		_count_refused(batch_size, reason)
+		return
+	var halves := code == 413 or error == "batch_too_large" or (code == 400 and PER_EVENT_400.has(error))
+	if halves and batch_size > 1:
+		_split_batch_size = maxi(1, batch_size / 2)
+		push_warning("Ravensight: batch refused (%s), splitting to %d" % [reason, _split_batch_size])
+		return
+	_drop_front(batch_size)
+	_count_refused(batch_size, reason)
+
+func _count_refused(count: int, reason: String) -> void:
+	_delivery_stats["dropped_refused"] += count
+	_log_once("dropped_400", "Ravensight: dropped events the server refused (%s)" % reason, false)
+	flush_failed.emit(reason)
 
 ## --- Public API: feedback (POST /api/v1/feedback) --------------------------------
 

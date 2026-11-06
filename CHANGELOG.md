@@ -2,9 +2,36 @@
 
 ## Unreleased
 
-### Changed
+Held until the Ravensight server release that accepts origins, signatures,
+gzip bodies and the ad and attribution keys is deployed. The version is set
+at release.
 
-- Event timestamps are unix milliseconds, so events in one second keep their order in funnels and sessions. Needs a Ravensight server that keeps milliseconds. Older versions keep working unchanged, and events queued by an older version are sent as they were recorded.
+### Breaking
+
+- Experiment tags follow the exposure contract: an event carries `rs_exp_<key>` only after the game first reads a config value in that session, not after a fetch. A well-formed `rs_exp_<key>` the game sets is left alone.
+- A 403 on a batch, and the kill switch, keep the queued events on disk for the next launch instead of discarding them.
+- A batch 401 opens a new session once (was twice), then waits for the backoff.
+- Backoff waits are multiplied by a random factor from 0.5 up to 1 (was plus or minus 20 percent).
+- A 400 that is not about one event (such as `invalid_json`) drops that request's events instead of halving.
+
+### Added
+
+- Saved queue: unsent events in `user://ravensight/queue-<hash>.json`, format version 2, written atomically, at most 500 events, events older than 89 days dropped on load, removed only after a 2xx or a refusing 400. `get_delivery_stats()` counts what was let go.
+- Each session's `origin` is saved with its events and sent on every event a later session delivers, so the server files it under the session, build and platform it happened in.
+- gzip for request bodies of 1,024 bytes or more; a 415, or a 413 for one compressed event, is resent uncompressed once (a 413 for one uncompressed event is dropped, as before).
+- Request signing (`X-Ravensight-Timestamp`, `X-Ravensight-Signature`) when the session answer has `signing`, with the clock corrected by `serverTime`. The secret is never written to disk.
+- A 400 with `index` drops only that event; `batch_too_large` halves the batch like a 413.
+- Gameplay events queue ahead of captured errors, and neither eviction nor that ordering ever moves an event in the batch in flight (which is removed by count when it is answered).
+- `track_ad()`, `track_ad_revenue()`, `micros_from_decimal_string()`, `micros_from_revenue()`, `set_attribution()` (once per install) and `get_device_id()`.
+- `rs_exposure`, sent once at a session's first exposure.
+- Device fields on the session: `model`, `osVersion` and `gpu`, as the engine reports them.
+- Event timestamps are unix milliseconds, so events in one second keep their order in funnels and sessions. Events queued by an older version are sent as they were recorded.
+- The background marker of a run killed on mobile is replayed through the saved queue under that run's origin.
+
+### Fixed
+
+- Control characters in event data are escaped in request bodies. GDScript's `JSON.stringify` wrote them raw, which made the server refuse the whole batch.
+- The local 8 KB check counts an error event's `rs_message`, `rs_stack` and `rs_trail` (within 200, 2,000 and 1,500 characters) one byte a character, as the server does, so an allowed stack is never dropped on the device.
 
 ## [0.4.0] - 2026-11-06
 
