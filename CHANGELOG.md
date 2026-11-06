@@ -17,6 +17,8 @@
   minute) and on-device scrubbing before anything is queued.
 - An opt-in trail of the last 20 printed lines and tracked event names,
   sent with an error only when the game's trail switch is on.
+- A home folder scrubs as the whole name, spaces included, and
+  `C:\Documents and Settings\<name>` is a home folder (scrub contract 5).
 
 ### Fixed
 

@@ -1646,9 +1646,10 @@ func _scrub(text: String, limit: int = MAX_ERROR_STACK_CHARS) -> String:
 			# IPv6: the full eight groups, or a compressed form with "::". A
 			# match needs a digit, so a C++ scope such as Face::Add stays.
 			["ipv6:(?i)\\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\\b|\\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4}\\b|(?<![\\w:])::1\\b", "[ip]"],
-			["/Users/[^/\\s]+", "~"],
-			["/home/[^/\\s]+", "~"],
-			["(?i)[A-Z]:\\\\Users\\\\[^\\\\\\s]+", "~"],
+			# A home folder is the whole segment up to the next slash, quote,
+			# <, >, ':' or end of line, spaces included (contract 5).
+			["/(?:Users|home)/[^/\\\\'\"<>:\\r\\n]+", "~"],
+			["(?i)[A-Z]:\\\\(?:Users|Documents and Settings)\\\\[^/\\\\'\"<>:\\r\\n]+", "~"],
 		]
 		for r in rules:
 			var re := RegEx.new()
