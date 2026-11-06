@@ -93,6 +93,25 @@ func _run() -> void:
 		"test_health_mobile_background_once_per_session",
 		"test_health_web_page_hide",
 		"test_health_no_samples_sends_nothing",
+		"test_error_capture_waits_for_settings",
+		"test_error_capture_needs_key_consent_and_enabled",
+		"test_error_capture_server_switch",
+		"test_error_capture_game_opt_out",
+		"test_error_capture_unsupported_engine",
+		"test_push_error_and_warning_captured",
+		"test_script_error_mapping",
+		"test_error_from_another_thread",
+		"test_sdk_own_lines_never_captured",
+		"test_error_caps_per_key_and_session",
+		"test_error_token_bucket",
+		"test_trail_off_by_default",
+		"test_trail_when_switch_on",
+		"test_trail_ring_and_caps",
+		"test_error_scrub_rules",
+		"test_errors_never_jump_gameplay",
+		"test_batch_413_splits_like_400",
+		"test_error_capture_removed_on_optout_and_kill",
+		"test_manual_track_error_with_switch_off",
 	]
 	for name in tests:
 		_current = name
@@ -1417,3 +1436,301 @@ func test_report_rejects_unsafe_storage() -> void:
 	reports.retry_report()
 	eq(sdk.unanswered().size(), 0, "retry cannot rebind to another session")
 	eq(failures.size(), 2, "scope change surfaced")
+
+# --- automatic error capture ----------------------------------------------------
+
+## True on an engine with the Logger API. Tests that need the real hook
+## skip their engine checks on older 4.x, where capture is unavailable.
+func logger_engine() -> bool:
+	var v := Engine.get_version_info()
+	return int(v["major"]) > 4 or (int(v["major"]) == 4 and int(v["minor"]) >= 5)
+
+## Started, with the settings answer carrying `capture` as errorCapture.
+func started_with_capture(capture: Variant = null, props: Dictionary = {}) -> Fake:
+	var sdk := start(props)
+	var settings := {"trackingEnabled": true}
+	if capture != null:
+		settings["errorCapture"] = capture
+	sdk.answer(200, settings)
+	sdk.answer_all_ok()
+	return sdk
+
+## A _log_error() call as the Logger buffers it.
+func logged(message: String, type: int = 2, frames: Array = [["do_thing", "res://game/player.gd", 12]], extra: Dictionary = {}) -> Dictionary:
+	var e := {"kind": "error", "function": "do_thing", "file": "res://game/player.gd", "line": 12, "code": message, "rationale": "", "type": type, "frames": frames, "own": false, "ms": 3000}
+	e.merge(extra, true)
+	return e
+
+func queued_errors(sdk: Fake) -> Array:
+	return sdk.pending_events.filter(func(e): return e["data"].get("rs_kind") == "error").map(func(e): return e["data"])
+
+func test_error_capture_waits_for_settings() -> void:
+	var sdk := start()
+	check(not sdk.is_error_capture_active(), "nothing installed before the settings answer")
+	var before := sdk.requests.size()
+	sdk.answer(200, {"trackingEnabled": true})
+	eq(sdk.is_error_capture_active(), logger_engine(), "installed once settings answer, absent errorCapture means on")
+	eq(sdk.requests.size(), before + 1, "installing makes no request of its own (only the session)")
+	sdk.answer_all_ok()
+	var other := start()
+	other.answer(500, {})
+	eq(other.is_error_capture_active(), logger_engine(), "a failed settings check means the default: on")
+
+func test_error_capture_needs_key_consent_and_enabled() -> void:
+	var nokey := start({"ingest_key": ""})
+	nokey.advance(10.0)
+	check(not nokey.is_error_capture_active(), "no key: nothing installed")
+	nokey.queue_free()
+	root.remove_child(nokey)
+	var optin := start({"consent": "opt_in"})
+	optin.advance(10.0)
+	check(not optin.is_error_capture_active(), "opt_in without a yes: nothing installed")
+	eq(optin.requests.size(), 0, "and no request")
+	root.remove_child(optin)
+	optin.free()
+	var off := start({"enabled": false})
+	check(not off.is_error_capture_active(), "enabled = false: nothing installed")
+	off.set_enabled(true)
+	off.answer_all_ok()
+	eq(off.is_error_capture_active(), logger_engine(), "installed once enabled and the settings answer")
+
+func test_error_capture_server_switch() -> void:
+	var sdk := started_with_capture({"enabled": false, "trail": true})
+	check(not sdk.is_error_capture_active(), "the game's switch off: nothing installed")
+	push_error("switched off")
+	sdk.advance(0.0)
+	eq(queued_errors(sdk), [], "nothing captured")
+	# A session answer that says on turns it on; one that omits it changes nothing.
+	sdk._apply_error_capture_settings({"token": "t"}, false)
+	check(not sdk.is_error_capture_active(), "an answer without errorCapture keeps it off")
+	sdk._apply_error_capture_settings({"errorCapture": {"enabled": true}}, false)
+	eq(sdk.is_error_capture_active(), logger_engine(), "an answer with enabled true installs it")
+	sdk._apply_error_capture_settings({"errorCapture": {"enabled": false}}, false)
+	check(not sdk.is_error_capture_active(), "and enabled false removes it")
+
+func test_error_capture_game_opt_out() -> void:
+	var sdk := started_with_capture(null, {"error_capture": false})
+	check(not sdk.is_error_capture_active(), "error_capture = false: nothing installed")
+	sdk.set_error_capture(true)
+	eq(sdk.is_error_capture_active(), logger_engine(), "set_error_capture(true) installs it")
+	sdk.set_error_capture(false)
+	check(not sdk.is_error_capture_active(), "set_error_capture(false) removes it")
+
+func test_error_capture_unsupported_engine() -> void:
+	var sdk := make()
+	sdk.logger_supported = false
+	root.add_child(sdk)
+	sdk.answer_all_ok()
+	check(not sdk.is_error_capture_active(), "unavailable before Godot 4.5")
+	check(sdk._logged_once.has("error_capture_unavailable"), "one line says so")
+	sdk.track_error("error", "manual still works")
+	eq(queued_errors(sdk).size(), 1, "track_error still queues")
+
+func test_push_error_and_warning_captured() -> void:
+	if not logger_engine():
+		return
+	var sdk := started_with_capture()
+	push_error("door 42 failed to open")
+	push_warning("low ammo")
+	sdk.advance(0.0)
+	var errors := queued_errors(sdk)
+	eq(errors.size(), 2, "one event each")
+	if errors.size() != 2:
+		return
+	eq(errors[0]["rs_source"], "log", "push_error is a log capture")
+	eq(errors[0]["rs_severity"], "warning", "log captures are warnings")
+	eq(errors[0]["rs_error_type"], "ERROR", "error type from the Logger enum")
+	eq(errors[0]["rs_message"], "door 42 failed to open", "message")
+	check(str(errors[0].get("rs_stack", "")).begins_with("at test_push_error_and_warning_captured (res://tests/run.gd:"), "stack from the script backtrace: " + str(errors[0].get("rs_stack", "")))
+	eq(errors[1]["rs_error_type"], "WARNING", "push_warning")
+	check(not errors[0].has("rs_trail"), "no trail while the switch is off")
+	eq(sdk.pending_events[sdk.pending_events.size() - 1]["event"], "error", "default event name")
+
+func test_script_error_mapping() -> void:
+	var sdk := started_with_capture()
+	sdk._capture_logged_error(logged("Invalid access to property or key 'foo' on a base object of type 'Nil'.", 2, [["bad", "res://game/player.gd", 14], ["_ready", "res://game/main.gd", 3]]))
+	var d: Dictionary = queued_errors(sdk)[0]
+	eq(d["rs_source"], "uncaught", "a script error is uncaught")
+	eq(d["rs_severity"], "error", "and an error")
+	eq(d["rs_error_type"], "SCRIPT", "type")
+	eq(d["rs_stack"], "at bad (res://game/player.gd:14)\nat _ready (res://game/main.gd:3)", "frames, most recent first")
+	# A release build without call stack tracking: the place from the call.
+	sdk._capture_logged_error(logged("other failure", 2, []))
+	eq(queued_errors(sdk)[1]["rs_stack"], "at do_thing (res://game/player.gd:12)", "fallback frame")
+	# An engine error with a rationale prefers it, and has no stack without frames.
+	sdk._capture_logged_error(logged("Condition \"x\" is true.", 0, [], {"rationale": "Texture missing", "file": "scene/main/node.cpp"}))
+	var e: Dictionary = queued_errors(sdk)[2]
+	eq(e["rs_message"], "Texture missing", "rationale wins")
+	check(not e.has("rs_stack"), "no in-app frame, no stack")
+	sdk._capture_logged_error(logged("shader broke", 3, []))
+	eq(queued_errors(sdk)[3]["rs_error_type"], "SHADER", "shader errors are log captures")
+
+func test_error_from_another_thread() -> void:
+	if not logger_engine():
+		return
+	var sdk := started_with_capture()
+	var t := Thread.new()
+	t.start(func(): push_error("worker fell over"))
+	t.wait_to_finish()
+	eq(queued_errors(sdk).size(), 0, "nothing queued from the other thread")
+	sdk.advance(0.0)
+	eq(queued_errors(sdk).map(func(d): return d["rs_message"]), ["worker fell over"], "queued on the main thread")
+
+func test_sdk_own_lines_never_captured() -> void:
+	var sdk := started_with_capture({"enabled": true, "trail": true})
+	if logger_engine():
+		push_warning("Ravensight: something of the SDK's own")
+		print("Ravensight: session ready")
+		# An SDK request failure logs its own warning.
+		sdk.track_event("x")
+		sdk.flush()
+		sdk.answer(500, {})
+		sdk.advance(0.0)
+	sdk._capture_logged_error(logged("busy", 0, [], {"own": true}))
+	sdk._capture_logged_error(logged("inside the SDK", 0, [["_send", "res://Ravensight.gd", 700]]))
+	sdk._capture_logged_error(logged("inside the SDK", 2, [], {"file": "res://addons/rs/Ravensight.gd"}))
+	eq(queued_errors(sdk), [], "never captured")
+	for line in sdk._trail:
+		check(not str(line).contains("Ravensight"), "never in the trail: " + str(line))
+
+func test_error_caps_per_key_and_session() -> void:
+	var sdk := started_with_capture()
+	for i in 5:
+		sdk._capture_logged_error(logged("enemy %d not found" % i))
+	eq(queued_errors(sdk).size(), 3, "3 per dedupe key (numbers are templated)")
+	for i in 60:
+		sdk.advance(20.0)
+		sdk._capture_logged_error(logged("distinct failure %s" % char(65 + i % 26) + char(65 + i / 26)))
+	eq(queued_errors(sdk).size(), 30, "30 per session")
+
+func test_error_token_bucket() -> void:
+	var sdk := started_with_capture()
+	var letters := "ABCDEFGHIJ"
+	for i in 8:
+		sdk._capture_logged_error(logged("failure " + letters[i]))
+	eq(queued_errors(sdk).size(), 6, "6 at once")
+	sdk.advance(10.0)
+	sdk._capture_logged_error(logged("failure I"))
+	sdk._capture_logged_error(logged("failure J"))
+	eq(queued_errors(sdk).size(), 7, "one more 10 seconds later")
+
+func test_trail_off_by_default() -> void:
+	var sdk := started_with_capture()
+	if sdk._error_logger != null:
+		eq(sdk._error_logger.get("want_messages"), false, "printed lines are not even buffered")
+	sdk.track_event("level_start")
+	sdk._capture_logged_error(logged("boom"))
+	eq(sdk._trail, [], "no ring")
+	check(not queued_errors(sdk)[0].has("rs_trail"), "no trail sent")
+
+func test_trail_when_switch_on() -> void:
+	if not logger_engine():
+		return
+	var sdk := started_with_capture({"enabled": true, "trail": true})
+	print("opened the door for test@example.com")
+	sdk.track_event("level_start", {"secret": "not in the trail"})
+	sdk.advance(0.0)
+	sdk._capture_logged_error(logged("boom"))
+	var trail := str(queued_errors(sdk)[0].get("rs_trail", ""))
+	var lines := trail.split("\n")
+	eq(lines.size(), 2, "two lines, oldest first")
+	var re := RegEx.new()
+	re.compile("^\\+\\d+ info opened the door for \\[email\\]$")
+	check(re.search(lines[0]) != null, "printed line, scrubbed: " + lines[0])
+	check(lines[1].ends_with(" event level_start"), "tracked event name only: " + lines[1])
+	check(not trail.contains("secret"), "never event data")
+
+func test_trail_ring_and_caps() -> void:
+	var sdk := started_with_capture({"enabled": true, "trail": true})
+	if not sdk.is_error_capture_active():
+		return
+	for i in 30:
+		sdk._trail_add(sdk._session_start_ms + i, "info", "line %d %s" % [i, "x".repeat(200)])
+	eq(sdk._trail.size(), 20, "a ring of 20")
+	check(sdk._trail.all(func(l): return str(l).length() <= 120), "each line at most 120")
+	check(str(sdk._trail[0]).begins_with("+10 info line 10 "), "oldest dropped first")
+	var text := sdk._trail_text()
+	check(text.length() <= 1500, "joined at most 1500")
+	check(text.ends_with(str(sdk._trail[19])), "the newest line is kept")
+	for i in 12:
+		sdk.advance(20.0)
+		sdk._capture_logged_error(logged("trail failure %s" % "ABCDEFGHIJKL"[i]))
+	var with_trail := queued_errors(sdk).filter(func(d): return d.has("rs_trail")).size()
+	eq(with_trail, 10, "10 trails a session")
+
+func test_error_scrub_rules() -> void:
+	var sdk := make()
+	var cases := {
+		"mail me at a.b@example.com": "mail me at [email]",
+		"Authorization: Bearer abc.def-123": "Authorization: Bearer [token]",
+		"jwt eyJhbGciOi.eyJzdWIiOiIx.c2lnbmF0dXJl here": "jwt [token] here",
+		"key gt_live_abc123 leaked": "key [token] leaked",
+		"blob " + "a1".repeat(20): "blob [token]",
+		"from 192.168.1.20 now": "from [ip] now",
+		"v6 fe80::1ff:fe23:4567:890a end": "v6 [ip] end",
+		"at 12:30:45 sharp": "at 12:30:45 sharp",
+		"open /Users/jacob/game/save.dat": "open ~/game/save.dat",
+		"open /home/jacob/save.dat": "open ~/save.dat",
+		"open C:\\Users\\Jacob\\save.dat": "open ~\\save.dat",
+		"GET https://api.example.com/v1/x?token=1#frag failed": "GET https://api.example.com/v1/x failed",
+		"res://game/player.gd:12": "res://game/player.gd:12",
+		"at handle_the_very_long_inventory_update_request (res://a.gd:3)": "at handle_the_very_long_inventory_update_request (res://a.gd:3)",
+	}
+	for input in cases:
+		eq(sdk._scrub(input), cases[input], "scrub '%s'" % input)
+	eq(sdk._message_template("enemy 12 at 0x1f 'goblin' id 0123456789abcdef"), "enemy <n> at <n>x<n>f <str> id <hex>", "template")
+	sdk.free()
+
+func test_errors_never_jump_gameplay() -> void:
+	var sdk := started_with_capture(null, {"max_queue_size": 4})
+	for i in 4:
+		sdk.track_event("play_%d" % i)
+	sdk._capture_logged_error(logged("too late"))
+	eq(queued_names(sdk), ["play_0", "play_1", "play_2", "play_3"], "a capture never evicts gameplay")
+	sdk.pending_events.clear()
+	sdk._capture_logged_error(logged("first"))
+	sdk.track_event("play_a")
+	sdk.track_event("play_b")
+	sdk.track_event("play_c")
+	sdk.track_event("play_d")
+	eq(queued_names(sdk), ["play_a", "play_b", "play_c", "play_d"], "a queued capture goes before any gameplay event")
+	sdk.pending_events.clear()
+	sdk.track_event("play_e")
+	sdk._capture_logged_error(logged("second"))
+	eq(queued_names(sdk), ["play_e", "error"], "captures queue behind gameplay")
+
+func test_batch_413_splits_like_400() -> void:
+	var sdk := started_with_capture()
+	for i in 4:
+		sdk.track_event("e%d" % i)
+	sdk.flush()
+	sdk.answer(413, {"error": "payload_too_large"})
+	eq(sdk._split_batch_size, 2, "split in half")
+	sdk.answer(413, {})
+	sdk.answer(413, {})
+	eq(signal_args("flush_failed").has("http_413"), true, "the single refused event is dropped")
+	sdk.answer_all_ok()
+	eq(sdk.pending_events.size(), 0, "the rest delivered, nothing retried as is")
+
+func test_error_capture_removed_on_optout_and_kill() -> void:
+	var sdk := started_with_capture()
+	sdk.set_tracking_enabled(false)
+	check(not sdk.is_error_capture_active(), "removed on opt-out")
+	sdk.set_tracking_enabled(true)
+	eq(sdk.is_error_capture_active(), logger_engine(), "back on opt-in (settings already read)")
+	sdk.set_enabled(false)
+	check(not sdk.is_error_capture_active(), "removed when the game turns the SDK off")
+	var killed := start()
+	killed.answer(200, {"trackingEnabled": false})
+	check(not killed.is_error_capture_active(), "never installed under the kill switch")
+	var other := started_with_capture()
+	root.remove_child(other)
+	check(not other.is_error_capture_active(), "removed when the node leaves the tree")
+	other.free()
+
+func test_manual_track_error_with_switch_off() -> void:
+	var sdk := started_with_capture({"enabled": false})
+	sdk.track_error("error", "manual 1")
+	var d: Dictionary = queued_errors(sdk)[0]
+	eq(d["rs_message"], "manual 1", "manual track_error always queues")
+	check(not d.has("rs_source"), "and carries no automatic source")

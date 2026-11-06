@@ -17,6 +17,8 @@ var ticks: int = 2500
 ## Every request: {method, path, headers, body, callback, answered}.
 var requests: Array = []
 var quit_codes: Array = []
+## False pretends the engine predates the Logger API (Godot before 4.5).
+var logger_supported: bool = true
 
 func _init() -> void:
 	super()
@@ -46,6 +48,9 @@ func _memory_mb() -> float:
 
 func _ticks_msec() -> int:
 	return ticks
+
+func _error_capture_supported() -> bool:
+	return logger_supported and super()
 
 func _quit_tree(exit_code: int) -> void:
 	quit_codes.append(exit_code)
