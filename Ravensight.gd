@@ -14,7 +14,7 @@
 extends Node
 
 ## The SDK version. Bumped with every tagged release.
-const VERSION := "0.3.1"
+const VERSION := "0.4.0"
 
 ## --- Signals -------------------------------------------------------------
 

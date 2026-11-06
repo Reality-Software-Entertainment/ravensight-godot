@@ -238,7 +238,7 @@ func test_api_base_forms() -> void:
 	eq(fresh.api_url, "https://api.ravensight.io", "default api_url is the bare host")
 	eq(Fake.REQUEST_TIMEOUT_SECONDS, 15.0, "request timeout")
 	eq(fresh.max_queue_size, 500, "default queue cap")
-	eq(Fake.VERSION, "0.3.1", "version constant")
+	eq(Fake.VERSION, "0.4.0", "version constant")
 	var plain: Node = load("res://Ravensight.gd").new()
 	eq(plain.ingest_key, "", "default ingest_key is empty")
 	eq(plain.consent, "opt_out", "default consent")
@@ -1127,7 +1127,7 @@ func test_session_request_carries_sdk() -> void:
 	var sdk := start()
 	sdk.answer(200, {"trackingEnabled": true})
 	var body = JSON.parse_string(sdk.requests[1]["body"])
-	eq(body["sdk"], "godot/0.3.1", "sdk name and version on session create")
+	eq(body["sdk"], "godot/0.4.0", "sdk name and version on session create")
 
 func test_track_purchase_properties() -> void:
 	var sdk := start()
