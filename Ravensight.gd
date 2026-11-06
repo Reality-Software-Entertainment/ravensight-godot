@@ -2514,13 +2514,16 @@ func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_fron
 	# Full: an automatic error goes first, so a storm of them can never push
 	# gameplay out; an automatic error never evicts a gameplay event, it is
 	# dropped itself.
+	# Nothing in the batch in flight is ever evicted: with nothing else to
+	# make room, the incoming event is the one dropped.
 	var automatic := _is_captured_error(event_data)
 	while not pending_events.is_empty() and pending_events.size() >= _queue_cap():
 		var error_index := _first_captured_error_index()
+		var victim := error_index if error_index >= 0 else (-1 if automatic else _oldest_droppable_index())
 		_delivery_stats["dropped_overflow"] += 1
-		if error_index < 0 and automatic:
+		if victim < 0:
 			return null
-		_remove_queued(error_index if error_index >= 0 else _oldest_droppable_index())
+		_remove_queued(victim)
 
 	var event := {
 		"event": event_name,
@@ -2554,9 +2557,12 @@ func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_fron
 func _queue_cap() -> int:
 	return clampi(max_queue_size, 1, QUEUE_MAX_EVENTS)
 
-## The oldest event that may make room: not this run's game_started.
+## The oldest event that may make room: outside the batch in flight and not
+## this run's game_started (unless it is all that is left), or -1.
 func _oldest_droppable_index() -> int:
-	var index := 0
+	var index := _inflight_size if _flush_in_progress else 0
+	if index >= pending_events.size():
+		return -1
 	while index < pending_events.size() - 1 and pending_events[index].get("_keep", false):
 		index += 1
 	return index
@@ -2566,7 +2572,10 @@ func _oldest_droppable_index() -> int:
 func _trim_queue() -> void:
 	while pending_events.size() > _queue_cap():
 		var error_index := _first_captured_error_index()
-		_remove_queued(error_index if error_index >= 0 else _oldest_droppable_index())
+		var victim := error_index if error_index >= 0 else _oldest_droppable_index()
+		if victim < 0:
+			return
+		_remove_queued(victim)
 		_delivery_stats["dropped_overflow"] += 1
 
 ## An error event's text fields and the length within which each counts one

@@ -21,7 +21,7 @@ at release.
 - gzip for request bodies of 1,024 bytes or more; a 415, or a 413 for one compressed event, is resent uncompressed once (a 413 for one uncompressed event is dropped, as before).
 - Request signing (`X-Ravensight-Timestamp`, `X-Ravensight-Signature`) when the session answer has `signing`, with the clock corrected by `serverTime`. The secret is never written to disk.
 - A 400 with `index` drops only that event; `batch_too_large` halves the batch like a 413.
-- The shared error queue rules: gameplay events (a game's own `track_error` included) go before captured errors, also after the queue is read from disk; a capture evicts only the oldest capture, never a gameplay event; `rs_trail` is never written to the queue file; opting out or resetting the id deletes persisted captures. Neither eviction nor ordering moves an event in the batch in flight.
+- The shared error queue rules: gameplay events (a game's own `track_error` included) go before captured errors, also after the queue is read from disk; a capture evicts only the oldest capture, never a gameplay event; `rs_trail` is never written to the queue file; opting out or resetting the id deletes persisted captures. Nothing in the batch in flight is ever evicted: with nothing else to make room, the incoming event is dropped. The README says how to keep the queue file out of Android and iOS backups, which Godot cannot do from a script.
 - `track_ad()`, `track_ad_revenue()`, `micros_from_decimal_string()`, `micros_from_revenue()`, `set_attribution()` (once per install) and `get_device_id()`.
 - `rs_exposure`, sent once at a session's first exposure.
 - Device fields on the session: `model`, `osVersion` and `gpu`, as the engine reports them.

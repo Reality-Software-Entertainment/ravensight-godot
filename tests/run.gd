@@ -128,6 +128,7 @@ func _run() -> void:
 		"test_error_rule_1_gameplay_before_captures",
 		"test_error_rule_2_full_queue",
 		"test_error_rule_3_trail_never_on_disk_and_optout_deletes",
+		"test_error_rule_inflight_never_evicted",
 		"test_fnv_queue_file_name",
 		"test_queue_persisted_with_origin_and_replayed",
 		"test_queue_kept_until_2xx_and_removal_saved_first",
@@ -2491,3 +2492,29 @@ func test_error_rule_3_trail_never_on_disk_and_optout_deletes() -> void:
 	check(_read(_queue_file(sdk)).contains("capture"), "persisted again")
 	sdk.reset_device_id()
 	eq(_read(_queue_file(sdk)), "", "a device id reset deletes persisted captures")
+
+func test_error_rule_inflight_never_evicted() -> void:
+	var sdk := started_with_session({"max_queue_size": 4})
+	sdk.track_event("c1", CAPTURE)
+	sdk.track_event("a")
+	sdk.flush()
+	var batch: Dictionary = sdk.unanswered()[0]
+	eq(sdk.event_names(batch), ["a", "c1"], "a batch with a capture in flight")
+	sdk.track_event("b")
+	sdk.track_event("c2", CAPTURE)
+	sdk.track_event("c3", CAPTURE)
+	eq(queued_names(sdk), ["a", "c1", "b", "c3"], "the capture outside the flight went, not the one in it")
+	sdk.track_event("c4", CAPTURE)
+	eq(queued_names(sdk), ["a", "c1", "b", "c4"], "again the capture outside the flight")
+	sdk.track_event("c")
+	eq(queued_names(sdk), ["a", "c1", "b", "c"], "gameplay evicts the capture outside the flight, not the one in it")
+	sdk.answer(202, {})
+	eq(queued_names(sdk), ["b", "c"], "the answer removes exactly the batch it sent")
+	# Everything queued is in flight: the incoming event is dropped.
+	var full := started_with_session({"max_queue_size": 2})
+	full.track_event("x", CAPTURE)
+	full.track_event("y")
+	full.flush()
+	full.track_event("z")
+	full.track_event("w", CAPTURE)
+	eq(queued_names(full), ["y", "x"], "nothing in flight is evicted, the incoming events are dropped")

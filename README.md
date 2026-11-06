@@ -204,6 +204,19 @@ Events are never lost to a crash, a closed game or a dead connection:
   dropped when it is read (the server keeps nothing past 90).
   `get_delivery_stats()` counts both. A captured error's `rs_trail` is never
   written to the file.
+- **Device backups.** The file holds origin stamps and scrubbed error
+  captures, so it should stay out of device backups. Godot gives a script
+  no way to exclude a file, so the game does it:
+  - **Android:** `user://` is in the app's internal files, which Auto Backup
+    copies. Turn backup off with the export option
+    `user_data_backup/allow`, or, in a custom Gradle build, exclude the
+    folder with a backup rules file: `<exclude domain="file"
+    path="ravensight/" />` in both `full-backup-content` and
+    `data-extraction-rules`.
+  - **iOS:** set `NSURLIsExcludedFromBackupKey` on the `ravensight` folder
+    inside the user data folder (`OS.get_user_data_dir()`) from a small
+    native plugin.
+  - Desktop builds need nothing.
 - **Removed only when delivered.** An event leaves the file only after a 2xx
   answer, or a 400 that refuses it, and that removal is saved first.
 - **Origin.** Each session's events are saved with the session answer's
