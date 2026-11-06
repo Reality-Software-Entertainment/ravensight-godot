@@ -122,6 +122,14 @@ signal event_tracked(event_name: String, data: Dictionary)
 ## page is hidden (web) or the game quits (desktop). Off by default.
 @export var performance: bool = false
 
+## Automatic error capture, on by default (Godot 4.5 and later only; on
+## older 4.x it is simply unavailable). Script errors, push_error() and
+## push_warning() become ordinary `error` events. Nothing is installed
+## without a key, before the player's consent, or while the game's
+## Errors setting on the server is off. Set false to opt the game out; see
+## set_error_capture() for changing it during the run.
+@export var error_capture: bool = true
+
 ## --- Constants --------------------------------------------------------------
 
 const MAX_BATCH_SIZE: int = 50          # server hard limit on /track/batch
@@ -148,6 +156,66 @@ const HEALTH_RESERVOIR_SIZE: int = 600
 const HEALTH_SAMPLE_SECONDS: float = 1.0
 const MAX_ERROR_MESSAGE_CHARS: int = 200
 const MAX_ERROR_STACK_CHARS: int = 2000
+const MAX_ERROR_TYPE_CHARS: int = 100
+## Device caps on automatic capture, per session. Over a cap the capture
+## is dropped silently. Manual track_error() calls are never capped.
+const ERROR_CAPTURE_MAX_PER_SESSION: int = 30
+const ERROR_CAPTURE_MAX_PER_KEY: int = 3
+const ERROR_CAPTURE_MAX_TRAILS: int = 10
+## A token bucket: at most this many captures a minute, refilled evenly.
+const ERROR_CAPTURE_PER_MINUTE: int = 6
+## The trail: the last TRAIL_LINES lines, each at most TRAIL_LINE_CHARS,
+## sent joined (oldest first) and at most TRAIL_CHARS.
+const TRAIL_LINES: int = 20
+const TRAIL_LINE_CHARS: int = 120
+const TRAIL_CHARS: int = 1500
+## The ErrorType names of Godot's Logger, sent as rs_error_type.
+const LOGGER_ERROR_TYPES: Array[String] = ["ERROR", "WARNING", "SCRIPT", "SHADER"]
+
+## The Logger subclass behind automatic capture. Kept as source and
+## compiled at run time, only on Godot 4.5 and later: a script that extends
+## Logger does not parse on older engines, and this keeps the SDK one file.
+## It runs on whatever thread logged, so it only copies plain values into a
+## Mutex-guarded buffer; the SDK drains that buffer on the main thread.
+const _LOGGER_SOURCE := """extends Logger
+const MAX_PENDING := 64
+const MAX_FRAMES := 20
+var active := true
+var want_messages := false
+var sdk_busy := false
+var _mutex := Mutex.new()
+var _pending: Array = []
+
+func _log_error(function: String, file: String, line: int, code: String, rationale: String, _editor_notify: bool, error_type: int, script_backtraces: Array[ScriptBacktrace]) -> void:
+	if not active:
+		return
+	var frames: Array = []
+	for bt in script_backtraces:
+		if bt == null:
+			continue
+		for i in mini(bt.get_frame_count(), MAX_FRAMES):
+			frames.append([bt.get_frame_function(i), bt.get_frame_file(i), bt.get_frame_line(i)])
+	var own := sdk_busy and OS.get_thread_caller_id() == OS.get_main_thread_id()
+	_push({"kind": "error", "function": function, "file": file, "line": line, "code": code.substr(0, 1000), "rationale": rationale.substr(0, 1000), "type": error_type, "frames": frames, "own": own, "ms": Time.get_ticks_msec()})
+
+func _log_message(message: String, error: bool) -> void:
+	if not active or not want_messages:
+		return
+	_push({"kind": "message", "text": message.substr(0, 400), "error": error, "ms": Time.get_ticks_msec()})
+
+func _push(entry: Dictionary) -> void:
+	_mutex.lock()
+	if _pending.size() < MAX_PENDING:
+		_pending.append(entry)
+	_mutex.unlock()
+
+func drain() -> Array:
+	_mutex.lock()
+	var out := _pending
+	_pending = []
+	_mutex.unlock()
+	return out
+"""
 
 const DEVICE_ID_PATH: String = "user://device_id.save"
 ## Present only while the player has opted out (see set_tracking_enabled).
@@ -290,6 +358,27 @@ var _health_sent: bool = false
 var _boot_ms: int = -1
 var _last_memory_mb: float = -1.0
 
+## Error capture state. The game's switch arrives on the settings and
+## session answers as errorCapture: {enabled, trail}; absent means enabled,
+## no trail. Nothing is installed before the settings answer.
+var _error_settings_known: bool = false
+var _error_server_enabled: bool = true
+var _error_trail_enabled: bool = false
+## The installed Logger (an instance of _LOGGER_SOURCE), or null.
+var _error_logger: Object = null
+var _error_logger_script: GDScript = null
+## _ticks_msec() when the current session began: trail lines count from it.
+var _session_start_ms: int = 0
+## Per session caps (see ERROR_CAPTURE_MAX_PER_SESSION and friends).
+var _errors_captured: int = 0
+var _errors_by_key: Dictionary = {}
+var _trails_sent: int = 0
+var _error_tokens: float = float(ERROR_CAPTURE_PER_MINUTE)
+var _error_tokens_at: float = -1.0
+## The trail ring: at most TRAIL_LINES formatted lines, oldest first.
+var _trail: Array = []
+var _scrub_rules: Array = []
+
 ## --- Playtest mode ------------------------------------------------------------
 ##
 ## Set from RAVENSIGHT_PLAYTEST_TOKEN and RAVENSIGHT_PLAYTEST_RUN_ID (or the
@@ -315,6 +404,7 @@ var _playtest_reason: String = ""
 
 func _init() -> void:
 	_start_unix = _unix_now()
+	_session_start_ms = _ticks_msec()
 	_apply_playtest_env()
 	if playtest_token.is_empty():
 		# Read only: a saved id is used, but none is created before _ready()
@@ -385,6 +475,7 @@ func _process(delta: float) -> void:
 ## Runs the timers: the retry wait, the batching window and the quit
 ## deadline. Called every frame.
 func _tick() -> void:
+	_drain_error_logger()
 	var t := _now()
 	if _retry_at >= 0.0 and t >= _retry_at:
 		_retry_at = -1.0
@@ -423,6 +514,9 @@ func _take_over_quit() -> void:
 	if bool(ProjectSettings.get_setting("application/config/quit_on_go_back", true)) and tree.quit_on_go_back:
 		tree.quit_on_go_back = false
 		_owns_go_back_quit = true
+
+func _exit_tree() -> void:
+	_uninstall_error_logger()
 
 func _notification(what: int) -> void:
 	match what:
@@ -556,6 +650,7 @@ func _on_foregrounded() -> void:
 	_fps_next = 0
 	_started_queued = false
 	_exit_queued = false
+	_reset_error_session()
 	_queue_game_started(false)
 	_flush_pending(true)
 
@@ -727,6 +822,13 @@ func _random_nonce() -> String:
 ## api_base(); `callback` is called with (status, headers, body), where
 ## status is 0 for a network failure or a timeout.
 func _send(method: String, path: String, headers: Array, body: Variant, callback: Callable) -> void:
+	# Anything the engine logs while the SDK makes its own request is the
+	# SDK's, never a capture.
+	_set_sdk_busy(true)
+	_send_http(method, path, headers, body, callback)
+	_set_sdk_busy(false)
+
+func _send_http(method: String, path: String, headers: Array, body: Variant, callback: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = REQUEST_TIMEOUT_SECONDS
 	add_child(http)
@@ -880,6 +982,7 @@ func _on_settings_response(code: int, headers: PackedStringArray, body: PackedBy
 		if parsed is Dictionary and parsed.has("trackingEnabled") and not bool(parsed["trackingEnabled"]):
 			_on_server_tracking_disabled()
 			return
+		_apply_error_capture_settings(parsed, true)
 	elif code == 403 and error == "tracking_disabled":
 		_on_server_tracking_disabled()
 		return
@@ -897,6 +1000,9 @@ func _on_settings_response(code: int, headers: PackedStringArray, body: PackedBy
 		return
 	else:
 		_log_once("settings_failed", "Ravensight: could not fetch settings (HTTP %d); assuming tracking enabled" % code, false)
+	if not _error_settings_known:
+		# No answer to read: the game's switch is assumed at its default.
+		_apply_error_capture_settings(null, true)
 	_flush_pending()
 
 ## --- Session management (POST /api/v1/session) ---------------------------------
@@ -951,6 +1057,7 @@ func _on_session_response(code: int, headers: PackedStringArray, body: PackedByt
 			# string, which int() would mangle). expiresIn is the contract.
 			var expires_in := int(parsed.get("expiresIn", 86400))
 			session_expires_at = _unix_now() + expires_in
+			_apply_error_capture_settings(parsed, false)
 			_backoff_seconds = DEFAULT_RETRY_SECONDS
 			# A success ends any wait an explicit flush cut short.
 			_stop_retry()
@@ -1035,6 +1142,8 @@ func _can_send_now(explicit: bool) -> bool:
 func track_event(event_name: String, data: Dictionary = {}) -> void:
 	if not _is_active():
 		return
+	if str(data.get("rs_kind", "")) != "error":
+		_trail_add(_ticks_msec(), "event", event_name)
 	_enqueue_and_emit(event_name, data)
 	if not _is_ready:
 		return
@@ -1214,6 +1323,266 @@ func _typed_optional(props: Dictionary, options: Dictionary, key: String, option
 	if options.get(option) != null:
 		props[key] = options[option]
 
+## --- Automatic error capture (Godot 4.5 and later) ---------------------------------
+##
+## A Logger added with OS.add_logger() sees every error, warning and printed
+## line. Each script error (rs_source "uncaught") or push_error() and
+## push_warning() (rs_source "log") becomes one ordinary error event,
+## scrubbed on the device, within the per session caps. Printed lines and
+## tracked event names feed the trail, sent with an error only when the
+## game's trail switch is on.
+
+## Turns automatic capture on or off for this run (see `error_capture`).
+## Never saved. Manual track_error() calls are not affected.
+func set_error_capture(value: bool) -> void:
+	error_capture = value
+	_update_error_capture()
+
+## True while the capture Logger is installed.
+func is_error_capture_active() -> bool:
+	return _error_logger != null
+
+## True on engines with the Logger API (Godot 4.5 and later).
+func _error_capture_supported() -> bool:
+	var v := Engine.get_version_info()
+	var major := int(v.get("major", 0))
+	var minor := int(v.get("minor", 0))
+	if major < 4 or (major == 4 and minor < 5):
+		return false
+	return ClassDB.class_exists("Logger") and OS.has_method("add_logger")
+
+## Reads errorCapture: {enabled, trail} from a settings or session answer.
+## A missing key leaves a known switch alone and otherwise means the
+## default: enabled, no trail.
+func _apply_error_capture_settings(parsed: Variant, _from_settings: bool) -> void:
+	var value = parsed.get("errorCapture") if parsed is Dictionary else null
+	if value is Dictionary:
+		_error_server_enabled = not (value.get("enabled") is bool and value.get("enabled") == false)
+		_error_trail_enabled = value.get("trail") is bool and value.get("trail") == true
+		_error_settings_known = true
+	elif not _error_settings_known:
+		_error_server_enabled = true
+		_error_trail_enabled = false
+		_error_settings_known = true
+	if not _error_trail_enabled:
+		_trail.clear()
+	_update_error_capture()
+
+## Installs or removes the Logger so that it runs exactly while there is a
+## key, consent, an active SDK, the game's own error_capture and the
+## server's switch, and the settings answer has been read.
+func _update_error_capture() -> void:
+	var wanted := _is_ready and _is_active() and error_capture and _error_settings_known and _error_server_enabled
+	if wanted and _error_logger == null:
+		_install_error_logger()
+	elif not wanted and _error_logger != null:
+		_uninstall_error_logger()
+	if _error_logger != null:
+		_error_logger.set("want_messages", _error_trail_enabled)
+
+func _install_error_logger() -> void:
+	if not _error_capture_supported():
+		_log_once("error_capture_unavailable", "Ravensight: automatic error capture needs Godot 4.5 or later; track_error() still works", false)
+		return
+	if _error_logger_script == null:
+		var script := GDScript.new()
+		script.source_code = _LOGGER_SOURCE
+		if script.reload() != OK:
+			_log_once("error_capture_unavailable", "Ravensight: automatic error capture could not start on this engine; track_error() still works", false)
+			return
+		_error_logger_script = script
+	var logger: Object = _error_logger_script.new()
+	logger.set("want_messages", _error_trail_enabled)
+	OS.call("add_logger", logger)
+	_error_logger = logger
+
+func _uninstall_error_logger() -> void:
+	if _error_logger == null:
+		return
+	var logger := _error_logger
+	_error_logger = null
+	logger.set("active", false)
+	OS.call("remove_logger", logger)
+	_trail.clear()
+
+func _set_sdk_busy(value: bool) -> void:
+	if _error_logger != null:
+		_error_logger.set("sdk_busy", value)
+
+## Main thread: turns what the Logger buffered into trail lines and events.
+func _drain_error_logger() -> void:
+	if _error_logger == null:
+		return
+	var entries: Array = _error_logger.call("drain")
+	for entry in entries:
+		if _error_logger == null:
+			return
+		if entry.get("kind") == "message":
+			var text := str(entry.get("text", "")).strip_edges()
+			if not text.is_empty() and not _is_sdk_text(text):
+				_trail_add(int(entry.get("ms", 0)), "error" if entry.get("error") else "info", text)
+		else:
+			_capture_logged_error(entry)
+
+func _is_sdk_text(text: String) -> bool:
+	return text.begins_with("Ravensight")
+
+## The SDK's own scripts, by path: this file and any script extending it.
+func _is_sdk_file(file: String) -> bool:
+	if file.is_empty():
+		return false
+	var script: Script = get_script()
+	while script != null:
+		if script.resource_path == file:
+			return true
+		script = script.get_base_script()
+	return file.get_file() == "Ravensight.gd"
+
+## One buffered _log_error() call: builds the event, or drops it when it is
+## the SDK's own, over a cap, or empty.
+func _capture_logged_error(entry: Dictionary) -> void:
+	var rationale := str(entry.get("rationale", ""))
+	var message := rationale if not rationale.is_empty() else str(entry.get("code", ""))
+	message = message.strip_edges()
+	var frames: Array = entry.get("frames", [])
+	var file := str(entry.get("file", ""))
+	if message.is_empty() or entry.get("own") or _is_sdk_text(message) or _is_sdk_file(file):
+		return
+	if not frames.is_empty() and _is_sdk_file(str(frames[0][1])):
+		return
+	var type_index := int(entry.get("type", 0))
+	var error_type: String = LOGGER_ERROR_TYPES[type_index] if type_index >= 0 and type_index < LOGGER_ERROR_TYPES.size() else "ERROR"
+	var is_script := type_index == 2
+	var stack_lines: Array = []
+	for f in frames:
+		stack_lines.append("at %s (%s:%d)" % [f[0], f[1], int(f[2])])
+	if stack_lines.is_empty() and is_script and file.begins_with("res://"):
+		# A release build without call stack tracking still names the place.
+		stack_lines.append("at %s (%s:%d)" % [entry.get("function", ""), file, int(entry.get("line", 0))])
+	var level := "error" if (is_script or type_index == 0) else "warning"
+	var scrubbed := _scrub(message)
+	var first_frame := ""
+	if not frames.is_empty():
+		first_frame = "%s:%s" % [frames[0][1], frames[0][0]]
+	elif is_script:
+		first_frame = "%s:%s" % [file, entry.get("function", "")]
+	var key := "%s|%s|%s" % [error_type, _message_template(scrubbed), first_frame]
+	if _allow_capture(key):
+		var props := {
+			"rs_kind": "error",
+			"rs_severity": "error" if is_script else "warning",
+			"rs_source": "uncaught" if is_script else "log",
+			"rs_error_type": error_type.substr(0, MAX_ERROR_TYPE_CHARS),
+			"rs_message": scrubbed.substr(0, MAX_ERROR_MESSAGE_CHARS),
+		}
+		if not stack_lines.is_empty():
+			props["rs_stack"] = _scrub("\n".join(stack_lines)).substr(0, MAX_ERROR_STACK_CHARS)
+		if _error_trail_enabled and not _trail.is_empty() and _trails_sent < ERROR_CAPTURE_MAX_TRAILS:
+			_trails_sent += 1
+			props["rs_trail"] = _trail_text()
+		track_event("error", props)
+	# The error itself is context for the next one.
+	_trail_add(int(entry.get("ms", 0)), level, message)
+
+## The caps: 30 a session, 3 per dedupe key, and a token bucket of 6 a
+## minute. Counts only what passes.
+func _allow_capture(key: String) -> bool:
+	if _errors_captured >= ERROR_CAPTURE_MAX_PER_SESSION:
+		return false
+	if int(_errors_by_key.get(key, 0)) >= ERROR_CAPTURE_MAX_PER_KEY:
+		return false
+	var t := _now()
+	if _error_tokens_at >= 0.0:
+		_error_tokens = minf(float(ERROR_CAPTURE_PER_MINUTE), _error_tokens + (t - _error_tokens_at) * ERROR_CAPTURE_PER_MINUTE / 60.0)
+	_error_tokens_at = t
+	if _error_tokens < 1.0:
+		return false
+	_error_tokens -= 1.0
+	_errors_captured += 1
+	_errors_by_key[key] = int(_errors_by_key.get(key, 0)) + 1
+	return true
+
+## A new session (mobile, after the background timeout) gets fresh caps.
+func _reset_error_session() -> void:
+	_session_start_ms = _ticks_msec()
+	_errors_captured = 0
+	_errors_by_key.clear()
+	_trails_sent = 0
+	_error_tokens = float(ERROR_CAPTURE_PER_MINUTE)
+	_error_tokens_at = -1.0
+	_trail.clear()
+
+## Adds one line to the trail ring, only while capture runs with the trail
+## switch on. Never written to disk.
+func _trail_add(ms: int, level: String, text: String) -> void:
+	if _error_logger == null or not _error_trail_enabled:
+		return
+	var line := "+%d %s %s" % [maxi(0, ms - _session_start_ms), level, _scrub(text.replace("\n", " ").replace("\r", " ").strip_edges())]
+	_trail.append(line.substr(0, TRAIL_LINE_CHARS))
+	while _trail.size() > TRAIL_LINES:
+		_trail.pop_front()
+
+## The trail joined oldest first, dropping the oldest lines to fit.
+func _trail_text() -> String:
+	var lines := _trail.duplicate()
+	var text := "\n".join(lines)
+	while text.length() > TRAIL_CHARS and lines.size() > 1:
+		lines.pop_front()
+		text = "\n".join(lines)
+	return text.substr(0, TRAIL_CHARS)
+
+func _is_captured_error(data: Dictionary) -> bool:
+	return str(data.get("rs_kind", "")) == "error" and data.has("rs_source") and str(data["rs_source"]) != "manual"
+
+func _first_captured_error_index() -> int:
+	for i in pending_events.size():
+		var d = pending_events[i].get("data")
+		if d is Dictionary and _is_captured_error(d):
+			return i
+	return -1
+
+## The contract's scrub, applied on the device before anything is queued.
+func _scrub(text: String) -> String:
+	if _scrub_rules.is_empty():
+		var rules := [
+			# A URL loses its query and fragment.
+			["(\\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\\s?#]*)[?#][^\\s]*", "$1"],
+			["[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[email]"],
+			["(?i)\\bbearer\\s+[A-Za-z0-9._~+/=-]+", "Bearer [token]"],
+			["\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*", "[token]"],
+			["\\bgt_[A-Za-z0-9_]+", "[token]"],
+			["[A-Za-z0-9+/=_-]{32,}", "[token]"],
+			["\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b", "[ip]"],
+			# IPv6: the full eight groups, or a compressed form with "::".
+			["(?i)\\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\\b|\\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4}\\b|(?<![\\w:])::1\\b", "[ip]"],
+			["/Users/[^/\\s]+", "~"],
+			["/home/[^/\\s]+", "~"],
+			["(?i)[A-Z]:\\\\Users\\\\[^\\\\\\s]+", "~"],
+		]
+		for r in rules:
+			var re := RegEx.new()
+			re.compile(r[0])
+			_scrub_rules.append([re, r[1]])
+	var out := text
+	for rule in _scrub_rules:
+		out = (rule[0] as RegEx).sub(out, rule[1], true)
+	return out
+
+## The message with its variable parts replaced, for the local dedupe key.
+func _message_template(message: String) -> String:
+	var out := message
+	for pair in [
+		["[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", "<uuid>"],
+		["\\b[a-zA-Z][a-zA-Z0-9+.-]*://\\S+", "<url>"],
+		["\"[^\"]*\"|'[^']*'", "<str>"],
+		["\\b[0-9a-fA-F]{8,}\\b", "<hex>"],
+		["\\d+(\\.\\d+)?", "<n>"],
+	]:
+		var re := RegEx.new()
+		re.compile(pair[0])
+		out = re.sub(out, pair[1], true)
+	return out
+
 ## --- Health sampling ---------------------------------------------------------------
 
 ## Called every frame. Takes one reading per HEALTH_SAMPLE_SECONDS, never
@@ -1301,6 +1670,7 @@ func _update_reason() -> void:
 	if reason != _status_reason:
 		_status_reason = reason
 		status_changed.emit(reason)
+	_update_error_capture()
 
 func _is_active() -> bool:
 	return enabled and not _player_opted_out and not _killed and not _playtest_blocked and not _no_key and not _key_refused
@@ -1504,8 +1874,15 @@ func _enqueue(event_name: String, data: Dictionary, timestamp: int = -1, at_fron
 		return null
 
 	while not pending_events.is_empty() and pending_events.size() >= max_queue_size:
+		# Automatic error captures go first, so they never cost the game a
+		# gameplay event; with none queued, a new capture is itself dropped.
+		var error_index := _first_captured_error_index()
+		if error_index >= 0:
+			_remove_queued(error_index)
+		elif _is_captured_error(event_data):
+			return null
 		# Drop the oldest, but keep a queued game_started at the front.
-		if pending_events.size() > 1 and str(pending_events[0].get("event", "")) == "game_started":
+		elif pending_events.size() > 1 and str(pending_events[0].get("event", "")) == "game_started":
 			_remove_queued(1)
 		else:
 			_remove_queued(0)
@@ -1663,12 +2040,12 @@ func _on_batch_response(code: int, headers: PackedStringArray, body: PackedByteA
 		_update_reason()
 		flush_failed.emit(reason)
 		_schedule_retry(_extract_retry_after(headers))
-	elif code == 400:
+	elif code == 400 or code == 413:
 		# The server refuses the whole batch when any event in it violates a
-		# ceiling. Halve until the poison event is isolated, then drop it:
+		# ceiling (400), or when the body is too large (413). Halve until the poison event is isolated, then drop it:
 		# one bloated event must never cost the rest of its batch, and
 		# retrying the identical payload forever would deliver nothing.
-		var reason400 := error if not error.is_empty() else "http_400"
+		var reason400 := error if not error.is_empty() else "http_%d" % code
 		if batch_size <= 1:
 			_drop_front(batch_size)
 			_log_once("dropped_400", "Ravensight: dropped one event the server refused (%s)" % reason400, false)
