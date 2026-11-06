@@ -1142,7 +1142,9 @@ func _can_send_now(explicit: bool) -> bool:
 func track_event(event_name: String, data: Dictionary = {}) -> void:
 	if not _is_active():
 		return
-	if str(data.get("rs_kind", "")) != "error":
+	if str(data.get("rs_kind", "")) != "error" and _error_logger != null:
+		# Lines the Logger buffered came first: take them before this one.
+		_drain_error_logger()
 		_trail_add(_ticks_msec(), "event", event_name)
 	_enqueue_and_emit(event_name, data)
 	if not _is_ready:
@@ -1551,7 +1553,9 @@ func _scrub(text: String) -> String:
 			["(?i)\\bbearer\\s+[A-Za-z0-9._~+/=-]+", "Bearer [token]"],
 			["\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*", "[token]"],
 			["\\bgt_[A-Za-z0-9_]+", "[token]"],
-			["[A-Za-z0-9+/=_-]{32,}", "[token]"],
+			# Runs of 32 or more base64 or hex characters with at least one
+			# digit, so long snake_case function names in a stack survive.
+			["(?<![A-Za-z0-9+/=_-])(?=[A-Za-z_+/=-]*[0-9])[A-Za-z0-9+/=_-]{32,}", "[token]"],
 			["\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b", "[ip]"],
 			# IPv6: the full eight groups, or a compressed form with "::".
 			["(?i)\\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\\b|\\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4}\\b|(?<![\\w:])::1\\b", "[ip]"],
