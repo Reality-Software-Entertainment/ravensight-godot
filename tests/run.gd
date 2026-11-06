@@ -121,6 +121,7 @@ func _run() -> void:
 		"test_logger_compile_failure_tried_once",
 		"test_boot_errors_dropped_on_exit",
 		"test_printed_lines_never_evict_errors",
+		"test_shared_scrub_vectors",
 	]
 	for name in tests:
 		_current = name
@@ -1672,7 +1673,7 @@ func test_error_scrub_rules() -> void:
 	var sdk := make()
 	var cases := {
 		"mail me at a.b@example.com": "mail me at [email]",
-		"Authorization: Bearer abc.def-123": "Authorization: Bearer [token]",
+		"Authorization: Bearer abc.def-123": "Authorization: [token]",
 		"jwt eyJhbGciOi.eyJzdWIiOiIx.c2lnbmF0dXJl here": "jwt [token] here",
 		"key gt_live_abc123 leaked": "key [token] leaked",
 		"blob " + "a1".repeat(20): "blob [token]",
@@ -1878,3 +1879,15 @@ func test_printed_lines_never_evict_errors() -> void:
 	eq(lines.size(), 20, "a full trail of buffered lines")
 	check(lines[19].contains(" info chatty line "), "oldest first, the newest printed line last: " + lines[19])
 	check(sdk._error_logger.call("drain").is_empty(), "the buffers are empty after the drain")
+
+## tests/scrub-vectors.json is copied unchanged from the platform repo's
+## docs/errors/scrub-vectors.json: the server and every SDK must agree.
+func test_shared_scrub_vectors() -> void:
+	var doc = JSON.parse_string(FileAccess.get_file_as_string("res://tests/scrub-vectors.json"))
+	check(doc is Dictionary and doc.get("cases") is Array and doc["cases"].size() > 0, "the fixture loads")
+	if not doc is Dictionary:
+		return
+	var sdk := make()
+	for c in doc["cases"]:
+		eq(sdk._scrub(str(c["in"])), str(c["out"]), "vector '%s'" % c["name"])
+	sdk.free()

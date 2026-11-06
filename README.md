@@ -348,7 +348,8 @@ hook and drops anything held at once.
 **What is never sent.** The SDK's own requests and log lines are never
 captured. Messages, stacks and the trail are scrubbed on the device before
 they are queued: email addresses become `[email]`, tokens, `gt_` keys and
-long base64 or hex runs become `[token]`, IP addresses become `[ip]`, home
+long base64 or hex runs with a digit become `[token]` (a file path such as
+`res://addons/inventory2/slot.gd` is kept), IP addresses become `[ip]`, home
 folders become `~`, and a URL loses its query and fragment.
 
 **Bounded spend.** One captured error is one event on your usage meter.

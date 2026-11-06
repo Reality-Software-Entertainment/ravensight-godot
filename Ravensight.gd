@@ -390,6 +390,7 @@ var _error_logger_script: GDScript = null
 ## Set once compiling the Logger failed, so it is never retried this run.
 var _error_logger_failed: bool = false
 var _template_rules: Array = []
+var _long_run_rules: Array = []
 ## _ticks_msec() when the current session began: trail lines count from it.
 var _session_start_ms: int = 0
 ## Per session caps (see ERROR_CAPTURE_MAX_PER_SESSION and friends).
@@ -1633,12 +1634,11 @@ func _scrub(text: String) -> String:
 			# A URL loses its query and fragment.
 			["(\\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\\s?#]*)[?#][^\\s]*", "$1"],
 			["[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[email]"],
-			["(?i)\\bbearer\\s+[A-Za-z0-9._~+=-]+", "Bearer [token]"],
+			["(?i)\\bbearer\\s+[A-Za-z0-9._~+/=-]+", "[token]"],
 			["\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*", "[token]"],
 			["\\bgt_[A-Za-z0-9_]+", "[token]"],
-			# Runs of 32 or more base64 or hex characters with at least one
-			# digit, so long snake_case function names in a stack survive.
-			["(?<![A-Za-z0-9+=_-])(?=[A-Za-z_+=-]*[0-9])[A-Za-z0-9+=_-]{32,}", "[token]"],
+			# Long base64 or hex runs: see _scrub_long_runs(), between these.
+			["", ""],
 			["\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b", "[ip]"],
 			# IPv6: the full eight groups, or a compressed form with "::".
 			["(?i)\\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\\b|\\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4}\\b|(?<![\\w:])::1\\b", "[ip]"],
@@ -1648,12 +1648,53 @@ func _scrub(text: String) -> String:
 		]
 		for r in rules:
 			var re := RegEx.new()
-			re.compile(r[0])
+			if not r[0].is_empty():
+				re.compile(r[0])
 			_scrub_rules.append([re, r[1]])
 	var out := text
 	for rule in _scrub_rules:
-		out = (rule[0] as RegEx).sub(out, rule[1], true)
+		if rule[1] == "":
+			out = _scrub_long_runs(out)
+		else:
+			out = (rule[0] as RegEx).sub(out, rule[1], true)
 	return out
+
+## A run of 32 or more base64 characters with a digit becomes [token],
+## unless it is a path: it has a "/" and every piece between slashes is
+## empty or a path word (snake or kebab case, CamelCase, or a short
+## capitalised word) under 32 characters. A secret with slashes is still a
+## token; a res:// path with a digit in it is not.
+func _scrub_long_runs(text: String) -> String:
+	if _long_run_rules.is_empty():
+		for pattern in ["[A-Za-z0-9+/=_-]{32,}", "[0-9]", "^[a-z0-9]+([_-][a-z0-9]+)*$", "^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$", "^[A-Z0-9]{1,6}$"]:
+			var re := RegEx.new()
+			re.compile(pattern)
+			_long_run_rules.append(re)
+	var out := ""
+	var at := 0
+	for m in (_long_run_rules[0] as RegEx).search_all(text):
+		var run := m.get_string()
+		out += text.substr(at, m.get_start() - at)
+		out += "[token]" if (_long_run_rules[1] as RegEx).search(run) != null and not _is_path_run(run) else run
+		at = m.get_end()
+	return out + text.substr(at)
+
+func _is_path_run(run: String) -> bool:
+	if not run.contains("/"):
+		return false
+	for piece in run.split("/"):
+		if piece.is_empty():
+			continue
+		if piece.length() >= 32:
+			return false
+		var word := false
+		for i in range(2, 5):
+			if (_long_run_rules[i] as RegEx).search(piece) != null:
+				word = true
+				break
+		if not word:
+			return false
+	return true
 
 ## The message with its variable parts replaced, for the local dedupe key.
 func _message_template(message: String) -> String:
