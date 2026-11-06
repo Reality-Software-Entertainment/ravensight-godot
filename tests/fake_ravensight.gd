@@ -59,6 +59,14 @@ func _process(_delta: float) -> void:
 	# Timers run only when a test calls advance().
 	pass
 
+## The real network path. Never reached in a test, because _send() below
+## replaces it; this override makes sure no test can ever open a socket,
+## whatever api_url is, and records the attempt so the runner fails.
+var network_attempts: Array = []
+
+func _send_http(method: String, path: String, _headers: Array, _body: Variant, _callback: Callable) -> void:
+	network_attempts.append("%s %s" % [method, path])
+
 func _send(method: String, path: String, headers: Array, body: Variant, callback: Callable) -> void:
 	requests.append({
 		"method": method,

@@ -164,6 +164,8 @@ const ERROR_CAPTURE_MAX_PER_KEY: int = 3
 const ERROR_CAPTURE_MAX_TRAILS: int = 10
 ## A token bucket: at most this many captures a minute, refilled evenly.
 const ERROR_CAPTURE_PER_MINUTE: int = 6
+## Boot errors held in memory until the game's switch is known.
+const MAX_HELD_ERRORS: int = 5
 ## The trail: the last TRAIL_LINES lines, each at most TRAIL_LINE_CHARS,
 ## sent joined (oldest first) and at most TRAIL_CHARS.
 const TRAIL_LINES: int = 20
@@ -360,8 +362,11 @@ var _last_memory_mb: float = -1.0
 
 ## Error capture state. The game's switch arrives on the settings and
 ## session answers as errorCapture: {enabled, trail}; absent means enabled,
-## no trail. Nothing is installed before the settings answer.
+## no trail. Before the first answer the Logger is already installed, but
+## what it captures is held (at most MAX_HELD_ERRORS) and sent only once an
+## answer says capture is on, otherwise discarded unsent.
 var _error_settings_known: bool = false
+var _held_errors: Array = []
 var _error_server_enabled: bool = true
 var _error_trail_enabled: bool = false
 ## The installed Logger (an instance of _LOGGER_SOURCE), or null.
@@ -1369,16 +1374,30 @@ func _apply_error_capture_settings(parsed: Variant, _from_settings: bool) -> voi
 	if not _error_trail_enabled:
 		_trail.clear()
 	_update_error_capture()
+	_release_held_errors()
+
+## The switch is known: boot errors held so far are queued when capture is
+## on (and the SDK still running), otherwise dropped unsent.
+func _release_held_errors() -> void:
+	var held := _held_errors
+	_held_errors = []
+	if _error_logger == null:
+		return
+	for props in held:
+		track_event("error", props)
 
 ## Installs or removes the Logger so that it runs exactly while there is a
 ## key, consent, an active SDK, the game's own error_capture and the
-## server's switch, and the settings answer has been read.
+## server's switch is not known to be off. Before the switch is known it
+## runs too, holding what it captures (see _held_errors).
 func _update_error_capture() -> void:
-	var wanted := _is_ready and _is_active() and error_capture and _error_settings_known and _error_server_enabled
+	var wanted := _is_ready and _is_active() and error_capture and (not _error_settings_known or _error_server_enabled)
 	if wanted and _error_logger == null:
 		_install_error_logger()
 	elif not wanted and _error_logger != null:
 		_uninstall_error_logger()
+	if not wanted:
+		_held_errors.clear()
 	if _error_logger != null:
 		_error_logger.set("want_messages", _error_trail_enabled)
 
@@ -1406,6 +1425,7 @@ func _uninstall_error_logger() -> void:
 	logger.set("active", false)
 	OS.call("remove_logger", logger)
 	_trail.clear()
+	_held_errors.clear()
 
 func _set_sdk_busy(value: bool) -> void:
 	if _error_logger != null:
@@ -1482,7 +1502,12 @@ func _capture_logged_error(entry: Dictionary) -> void:
 		if _error_trail_enabled and not _trail.is_empty() and _trails_sent < ERROR_CAPTURE_MAX_TRAILS:
 			_trails_sent += 1
 			props["rs_trail"] = _trail_text()
-		track_event("error", props)
+		if not _error_settings_known:
+			# A boot error: held until the game's switch is known.
+			if _held_errors.size() < MAX_HELD_ERRORS:
+				_held_errors.append(props)
+		else:
+			track_event("error", props)
 	# The error itself is context for the next one.
 	_trail_add(int(entry.get("ms", 0)), level, message)
 

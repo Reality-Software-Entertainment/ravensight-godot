@@ -112,6 +112,11 @@ func _run() -> void:
 		"test_batch_413_splits_like_400",
 		"test_error_capture_removed_on_optout_and_kill",
 		"test_manual_track_error_with_switch_off",
+		"test_boot_errors_held_then_sent",
+		"test_boot_errors_discarded_when_switch_off",
+		"test_boot_errors_cleared_on_optout_and_kill",
+		"test_boot_errors_wait_for_session_after_settings_429",
+		"test_tests_never_reach_the_network",
 	]
 	for name in tests:
 		_current = name
@@ -120,6 +125,7 @@ func _run() -> void:
 		await call(name)
 		for child in root.get_children():
 			if child is Fake:
+				check(child.network_attempts.is_empty(), "no real network request: %s" % str(child.network_attempts))
 				root.remove_child(child)
 				child.free()
 		_unset_playtest_env()
@@ -1466,11 +1472,10 @@ func queued_errors(sdk: Fake) -> Array:
 
 func test_error_capture_waits_for_settings() -> void:
 	var sdk := start()
-	check(not sdk.is_error_capture_active(), "nothing installed before the settings answer")
-	var before := sdk.requests.size()
+	eq(sdk.is_error_capture_active(), logger_engine(), "installed before the settings answer, to hold boot errors")
+	eq(sdk.paths(), ["/settings"], "installing makes no request of its own")
 	sdk.answer(200, {"trackingEnabled": true})
-	eq(sdk.is_error_capture_active(), logger_engine(), "installed once settings answer, absent errorCapture means on")
-	eq(sdk.requests.size(), before + 1, "installing makes no request of its own (only the session)")
+	eq(sdk.is_error_capture_active(), logger_engine(), "still installed once settings answer, absent errorCapture means on")
 	sdk.answer_all_ok()
 	var other := start()
 	other.answer(500, {})
@@ -1496,7 +1501,7 @@ func test_error_capture_needs_key_consent_and_enabled() -> void:
 
 func test_error_capture_server_switch() -> void:
 	var sdk := started_with_capture({"enabled": false, "trail": true})
-	check(not sdk.is_error_capture_active(), "the game's switch off: nothing installed")
+	check(not sdk.is_error_capture_active(), "the game's switch off: removed")
 	push_error("switched off")
 	sdk.advance(0.0)
 	eq(queued_errors(sdk), [], "nothing captured")
@@ -1734,3 +1739,67 @@ func test_manual_track_error_with_switch_off() -> void:
 	var d: Dictionary = queued_errors(sdk)[0]
 	eq(d["rs_message"], "manual 1", "manual track_error always queues")
 	check(not d.has("rs_source"), "and carries no automatic source")
+
+func test_boot_errors_held_then_sent() -> void:
+	var sdk := start()
+	for i in 7:
+		sdk._capture_logged_error(logged("boot failure %s" % "ABCDEFG"[i]))
+	eq(queued_errors(sdk), [], "nothing queued before the answer")
+	eq(sdk._held_errors.size(), 5, "at most 5 held")
+	sdk.answer(200, {"trackingEnabled": true, "errorCapture": {"enabled": true}})
+	eq(queued_errors(sdk).map(func(d): return d["rs_message"]), ["boot failure A", "boot failure B", "boot failure C", "boot failure D", "boot failure E"], "the held 5 are queued once capture is on")
+	eq(sdk._held_errors, [], "and no longer held")
+	if logger_engine():
+		push_error("real boot error")
+		var fresh := start()
+		push_error("real boot error")
+		fresh.advance(0.0)
+		eq(fresh._held_errors.size(), 1, "a real push_error before the answer is held")
+		fresh.answer(500, {})
+		eq(queued_errors(fresh).size(), 1, "and sent when settings fail (default on)")
+
+func test_boot_errors_discarded_when_switch_off() -> void:
+	var sdk := start()
+	sdk._capture_logged_error(logged("boot failure"))
+	eq(sdk._held_errors.size(), 1, "held")
+	sdk.answer(200, {"trackingEnabled": true, "errorCapture": {"enabled": false}})
+	eq(sdk._held_errors, [], "discarded")
+	check(not sdk.is_error_capture_active(), "and the hook removed")
+	sdk.answer_all_ok()
+	eq(sent_count(sdk, "error"), 0, "never sent")
+	var opted := start({"error_capture": false})
+	check(not opted.is_error_capture_active(), "error_capture = false: not even installed for boot")
+
+func test_boot_errors_cleared_on_optout_and_kill() -> void:
+	var killed := start()
+	killed._capture_logged_error(logged("boot failure"))
+	eq(killed._held_errors.size(), 1, "held")
+	killed.answer(200, {"trackingEnabled": false})
+	eq(killed._held_errors, [], "the kill switch drops them")
+	check(not killed.is_error_capture_active(), "and removes the hook")
+	eq(killed.pending_events.size(), 0, "nothing queued")
+	var sdk := start()
+	sdk._capture_logged_error(logged("boot failure"))
+	eq(sdk._held_errors.size(), 1, "held")
+	sdk.set_tracking_enabled(false)
+	eq(sdk._held_errors, [], "opt-out drops held errors")
+	check(not sdk.is_error_capture_active(), "and removes the hook")
+
+func test_boot_errors_wait_for_session_after_settings_429() -> void:
+	var sdk := start()
+	sdk._capture_logged_error(logged("boot failure"))
+	sdk.answer(429, {}, ["Retry-After: 5"])
+	eq(sdk._held_errors.size(), 1, "still held: no answer says on yet")
+	sdk.advance(6.0)
+	sdk.answer(201, {"token": "t", "expiresIn": 86400})
+	eq(sdk._held_errors, [], "released by the session answer")
+	eq(queued_errors(sdk).size(), 1, "and queued once")
+
+func test_tests_never_reach_the_network() -> void:
+	var sdk := make()
+	sdk.api_url = "https://api.ravensight.io"
+	sdk._send("GET", "/settings", [], "", func(_c, _h, _b): pass)
+	eq(sdk.network_attempts, [], "the fake transport never reaches the real one")
+	sdk._send_http("GET", "/settings", [], "", func(_c, _h, _b): pass)
+	eq(sdk.network_attempts, ["GET /settings"], "and the real one is replaced too")
+	sdk.free()

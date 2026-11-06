@@ -10,6 +10,9 @@
   `OS.add_logger()` and drained on the main thread. Installed only with a
   key, consent, an active SDK and the game's `errorCapture.enabled`.
   `error_capture`, `set_error_capture()` and `is_error_capture_active()`.
+- Boot errors: the hook installs at startup, and until the settings
+  answer arrives at most 5 captures are held in memory, then sent if the
+  game's switch is on or discarded unsent if it is off.
 - Device caps per session (30 captures, 3 per error, 10 trails, 6 a
   minute) and on-device scrubbing before anything is queued.
 - An opt-in trail of the last 20 printed lines and tracked event names,

@@ -333,11 +333,14 @@ build still sends a script error's own function, file and line, and
 `push_error()` arrives with no stack.
 
 **When it runs.** Nothing is installed without a key, before the
-player's consent (`consent = "opt_in"`), while the SDK is off, or until the
-settings check has answered. The error capture setting in the game's settings
-turns it off for every player; `error_capture = false` or
-`set_error_capture(false)` turns it off in your build. Opting out removes
-the hook at once.
+player's consent (`consent = "opt_in"`), or while the SDK is off. The hook
+goes in at startup so errors during boot are not lost, but until the
+settings check answers, at most 5 captures are held in memory: they are
+sent once the answer says capture is on, and discarded unsent if it is off.
+The error capture setting in the game's settings turns capture off for
+every player; `error_capture = false` or `set_error_capture(false)` turns
+it off in your build. Opting out, or the server's kill switch, removes the
+hook and drops anything held at once.
 
 **What is never sent.** The SDK's own requests and log lines are never
 captured. Messages, stacks and the trail are scrubbed on the device before
