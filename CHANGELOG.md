@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Automatic error capture on Godot 4.5 and later, on by default: script
+  errors (`rs_source` `uncaught`), `push_error()` and `push_warning()`
+  (`log`) become ordinary `error` events, through a logger added with
+  `OS.add_logger()` and drained on the main thread. Installed only with a
+  key, consent, an active SDK and the game's `errorCapture.enabled`.
+  `error_capture`, `set_error_capture()` and `is_error_capture_active()`.
+- Device caps per session (30 captures, 3 per error, 10 trails, 6 a
+  minute) and on-device scrubbing before anything is queued.
+- An opt-in trail of the last 20 printed lines and tracked event names,
+  sent with an error only when the game's trail switch is on.
+
+### Fixed
+
+- A 413 answer to a batch is split and the refused event dropped, like a
+  400, instead of being retried as is.
+- Captured errors are dropped before gameplay events when the queue is
+  full.
+
 ## 0.3.1 (held)
 
 ### Added

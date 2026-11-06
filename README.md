@@ -67,6 +67,7 @@ It is safe to call from any autoload, even before Ravensight's own
 | `flush_interval` | `5.0` | Seconds an event waits so it can go out with others. 50 waiting events go at once. |
 | `handle_quit` | `true` | Take over the window close (and the Android back button when it quits) to send the last events, holding the quit at most 1.5 seconds. See Quitting. |
 | `performance` | `false` | Opt in to one `health` event per session with frame rate, memory and boot time. See Typed events. |
+| `error_capture` | `true` | Automatic error capture on Godot 4.5 and later. `false` opts the game out. See Automatic error capture. |
 | `session_timeout` | `1800.0` | Android and iOS only: seconds in the background after which the session counts as over. See Automatic events. |
 
 ## Functions
@@ -90,6 +91,8 @@ It is safe to call from any autoload, even before Ravensight's own
 | `track_resource(flow, resource, amount, options = {})` | Queue a resource gained (`source`) or spent (`sink`). |
 | `track_progression(status, p1, options = {})` | Queue a progression step: `start`, `complete` or `fail`. |
 | `track_error(severity, message, options = {})` | Queue an error: `debug`, `info`, `warning`, `error` or `critical`. |
+| `set_error_capture(on)` | Turns automatic error capture on or off for this run. Never saved. |
+| `is_error_capture_active()` | `true` while the capture hook is installed. |
 | `fetch_suggestions()` | Experimental. Answers on `suggestions_received`; while tracking is off nothing is requested and it answers with an empty list. |
 
 `Ravensight.session_token` is the open session's token, or `""` until one
@@ -106,7 +109,7 @@ this token and have it send it as `joinToken` when it opens its own session
 | `tracking_disabled` | `source` | `"server"` for the kill switch, `"player"` after an opt-out (or a start with `consent = "opt_in"` and no yes yet), `"init"` when `enabled` is `false` or after `set_enabled(false)`, `"key"` when the server refused the ingest key and the run ended. |
 | `status_changed` | `reason` | `get_status_reason()` changed. |
 | `events_flushed` | `count` | A batch was accepted. `count` is the number sent; the server may store fewer, e.g. it drops events older than 90 days. |
-| `flush_failed` | `reason` | A batch failed. It is retried for you, except one event the server refuses with 400, which is dropped. `"event_too_large"` for an event whose data is over 8,192 bytes as JSON, dropped before it was queued. |
+| `flush_failed` | `reason` | A batch failed. It is retried for you, except one event the server refuses with 400 or 413, which is dropped. `"event_too_large"` for an event whose data is over 8,192 bytes as JSON, dropped before it was queued. |
 | `feedback_submitted` | | Feedback was accepted. |
 | `feedback_failed` | `reason` | Feedback failed: `"disabled"`, `"empty_message"`, `"invalid_category"`, `"invalid_rating"` or `"no_session"` before sending (no request is made), or the server's error code. |
 | `event_tracked` | `name, data` | Every queued event, with the data actually queued (a copy carrying `rs_event_id`). |
@@ -244,6 +247,7 @@ key and none of these options.
 | ravensight-godot | Godot | API | Notes |
 | --- | --- | --- | --- |
 | 0.2.0 | 4.x (CI on 4.5-stable) | `/api/v1` | The shared SDK contract. |
+| Unreleased | 4.x, error capture on 4.5+ (CI on 4.5-stable) | `/api/v1` | Automatic error capture needs the API's error capture support; turn it off with `error_capture = false` against an older API. |
 | 0.3.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
 
 ## Levels and deaths
@@ -303,6 +307,64 @@ which shows on the Implementation health card in the dashboard.
 | `p2`, `p3`, `score` | `track_progression` | `rs_p2`, `rs_p3`, `rs_score` |
 | `stack` | `track_error` | `rs_stack` |
 | `data`, `event_name` | all | extra properties, event name |
+
+### Automatic error capture
+
+On Godot 4.5 and later the SDK reports errors on its own, as ordinary
+`error` events through the same queue. It is on by default and needs no
+code. It adds a logger with `OS.add_logger()`, which only listens: Godot
+still prints and handles every error exactly as before.
+
+| What happens | `rs_source` | `rs_severity` | `rs_error_type` |
+| --- | --- | --- | --- |
+| A script error at run time, such as a call on `null` | `uncaught` | `error` | `SCRIPT` |
+| `push_error()`, or an engine error | `log` | `warning` | `ERROR` |
+| `push_warning()`, or an engine warning | `log` | `warning` | `WARNING` |
+| A shader error | `log` | `warning` | `SHADER` |
+
+`rs_stack` holds the script backtrace, most recent call first, one
+`at <function> (<file>:<line>)` per line. Errors raised on other threads
+are captured too, and queued on the main thread.
+
+**Stacks in release builds.** Godot records script backtraces only in
+editor and debug builds unless you turn on the project setting
+`debug/settings/gdscript/always_track_call_stacks`. Without it, a release
+build still sends a script error's own function, file and line, and
+`push_error()` arrives with no stack.
+
+**When it runs.** Nothing is installed without a key, before the
+player's consent (`consent = "opt_in"`), while the SDK is off, or until the
+settings check has answered. The error capture setting in the game's settings
+turns it off for every player; `error_capture = false` or
+`set_error_capture(false)` turns it off in your build. Opting out removes
+the hook at once.
+
+**What is never sent.** The SDK's own requests and log lines are never
+captured. Messages, stacks and the trail are scrubbed on the device before
+they are queued: email addresses become `[email]`, tokens, `gt_` keys and
+long base64 or hex runs become `[token]`, IP addresses become `[ip]`, home
+folders become `~`, and a URL loses its query and fragment.
+
+**Bounded spend.** One captured error is one event on your usage meter.
+Each session captures at most 30 errors, 3 of the same error (same type,
+same message once numbers and quoted text are set aside, same first
+frame), and 6 a minute. Anything over is dropped on the device. When the
+queue is full, captured errors are dropped before any gameplay event.
+
+**The trail.** With the trail switch on in the game's settings, an error
+carries `rs_trail`: the last 20 printed lines and tracked event names
+before it, oldest first, as `+<ms since session start> <level> <text>`.
+Event data is never in the trail. It is kept in memory only, never written
+to disk, and sent at most 10 times a session.
+
+**Before Godot 4.5**, the `Logger` class does not exist, so capture is
+simply unavailable (one line says so) and everything else works as
+before. `track_error()` works on every version and is never capped or
+switched off.
+
+**Failed requests.** The SDK does not hook your game's `HTTPRequest`
+nodes. Report a failed request yourself with `track_error()`; anything the
+engine logs about it is captured like any other error.
 
 ### Performance health
 
@@ -388,6 +450,14 @@ passing). CI runs both with Godot 4.5-stable on every push
 0.2.0 the real `HTTPRequest` path was also run once, by hand, against a
 local stub server (settings, session, two batches, quit, and a request that
 never answers giving up after 15 seconds), not against the hosted API.
+
+For automatic error capture the tests drive the real `OS.add_logger()`
+hook with `push_error()`, `push_warning()` and a worker thread, and skip
+those engine checks on engines before 4.5. It was also run by hand on
+Godot v4.8.dev1 in a sample project with the SDK as an autoload, against a
+local stub server: a real script error, `push_error()`, a worker thread
+warning and a repeated error all arrived as expected, within the caps and
+scrubbed. It has not been run on a real engine older than 4.5.
 
 ## Full documentation
 
