@@ -1687,12 +1687,13 @@ func _replace_with_digit(text: String, re: RegEx, replacement: String) -> String
 
 ## A run of 32 or more base64 characters with a digit becomes [token],
 ## unless it is a path: it has a "/" and every piece between slashes is
-## empty or a path word (snake or kebab case, CamelCase, or a short
-## capitalised word) under 32 characters. A secret with slashes is still a
+## empty or a path word under 32 characters: one or more parts joined by
+## "_" or "-", each part lowercase, CamelCase, or an acronym of 1 to 6
+## capitals or digits. A secret with slashes is still a
 ## token; a res:// path with a digit in it is not.
 func _scrub_long_runs(text: String) -> String:
 	if _long_run_rules.is_empty():
-		for pattern in ["[A-Za-z0-9+/=_-]{32,}", "[0-9]", "^[a-z0-9]+([_-][a-z0-9]+)*$", "^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$", "^[A-Z0-9]{1,6}$"]:
+		for pattern in ["[A-Za-z0-9+/=_-]{32,}", "[0-9]", "^[a-z0-9]+$", "^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$", "^[A-Z0-9]{1,6}$"]:
 			var re := RegEx.new()
 			re.compile(pattern)
 			_long_run_rules.append(re)
@@ -1713,13 +1714,16 @@ func _is_path_run(run: String) -> bool:
 			continue
 		if piece.length() >= 32:
 			return false
-		var word := false
-		for i in range(2, 5):
-			if (_long_run_rules[i] as RegEx).search(piece) != null:
-				word = true
-				break
-		if not word:
-			return false
+		for part in piece.replace("-", "_").split("_"):
+			if part.is_empty():
+				return false
+			var word := false
+			for i in range(2, 5):
+				if (_long_run_rules[i] as RegEx).search(part) != null:
+					word = true
+					break
+			if not word:
+				return false
 	return true
 
 ## The message with its variable parts replaced, for the local dedupe key.
