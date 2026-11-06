@@ -201,8 +201,9 @@ Events are never lost to a crash, a closed game or a dead connection:
   sending starts. At most 500 events are kept across launches, oldest
   dropped first (an automatic error is always dropped before a gameplay
   event, and queues behind gameplay), and events older than 89 days are
-  dropped when it is read
-  (the server keeps nothing past 90). `get_delivery_stats()` counts both.
+  dropped when it is read (the server keeps nothing past 90).
+  `get_delivery_stats()` counts both. A captured error's `rs_trail` is never
+  written to the file.
 - **Removed only when delivered.** An event leaves the file only after a 2xx
   answer, or a 400 that refuses it, and that removal is saved first.
 - **Origin.** Each session's events are saved with the session answer's
@@ -221,9 +222,8 @@ Events are never lost to a crash, a closed game or a dead connection:
   `X-Ravensight-Signature` over the uncompressed body, with the device clock
   corrected by the server's time. The secret stays in memory, never on disk.
 - **Refusals.** A 400 naming one event by `index` drops that event and resends
-  the rest. `batch_too_large` and 413 halve the batch. A 400 about one event
-  with no index (such as `event_too_large`) halves until that event is alone,
-  then drops it. Any other 400 drops the request's events. Every drop is
+  the rest. Only `batch_too_large` and 413 halve the batch. Any other 400
+  drops the request's events. Every drop is
   logged once, reported on `flush_failed` and counted. A 429, or a 503 with
   Retry-After, waits exactly the server's time. Turning tracking off as the
   player (`set_tracking_enabled(false)`) or resetting the identity deletes the

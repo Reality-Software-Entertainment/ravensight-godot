@@ -125,6 +125,9 @@ func _run() -> void:
 		"test_scrub_cuts_long_input_fast",
 		"test_event_timestamps_are_milliseconds",
 		"test_cold_launch_marker_in_milliseconds",
+		"test_error_rule_1_gameplay_before_captures",
+		"test_error_rule_2_full_queue",
+		"test_error_rule_3_trail_never_on_disk_and_optout_deletes",
 		"test_fnv_queue_file_name",
 		"test_queue_persisted_with_origin_and_replayed",
 		"test_queue_kept_until_2xx_and_removal_saved_first",
@@ -509,12 +512,14 @@ func test_offline_backoff() -> void:
 	eq(sdk.pending_events.size(), 0, "events kept and delivered")
 
 func test_batch_400_split() -> void:
+	# Only batch_too_large (and a 413) halve a batch; any other 400 without an
+	# index drops the request's events.
 	var sdk := started_with_session()
 	for i in 4:
 		sdk.track_event("e%d" % i)
 	sdk.flush()
 	var sizes := []
-	# e2 is the poison event: every batch containing it gets a 400.
+	# e2 is the poison event: a batch holding it is too large.
 	for i in 20:
 		var open := sdk.unanswered()
 		if open.is_empty():
@@ -522,13 +527,18 @@ func test_batch_400_split() -> void:
 		var names: Array = sdk.event_names(open[0])
 		sizes.append(names.size())
 		if names.has("e2"):
-			sdk.answer(400, {"error": "event_too_large"})
+			sdk.answer(400, {"error": "batch_too_large"})
 		else:
 			sdk.answer(202, {})
 	eq(sizes, [4, 2, 2, 1, 1], "halved until the bad event is alone, then the rest")
 	eq(sdk.pending_events.size(), 0, "queue drained")
-	check(signal_args("flush_failed").has("event_too_large"), "the drop is reported on flush_failed")
+	check(signal_args("flush_failed").has("batch_too_large"), "the drop is reported on flush_failed")
 	eq(signal_args("events_flushed"), [1, 2, 1], "game_started, then the other three are delivered")
+	sdk.track_event("x")
+	sdk.track_event("y")
+	sdk.flush()
+	sdk.answer(400, {"error": "event_too_large"})
+	eq(sdk.pending_events.size(), 0, "a 400 about one event with no index drops the request")
 
 func test_batching_window_and_batch_of_50() -> void:
 	var sdk := started_with_session()
@@ -2425,3 +2435,59 @@ func test_exposure_offline_event_keeps_tag() -> void:
 	var played := batch.filter(func(e): return e["event"] == "offline_play")
 	eq(played.size(), 1, "the queued event is sent on the next launch")
 	eq(played[0]["data"].get("rs_exp_difficulty"), "easy", "with the tag it was queued with")
+
+# --- error queue rules (all SDKs, 2026-11-06) -----------------------------------
+
+const CAPTURE := {"rs_kind": "error", "rs_severity": "error", "rs_message": "boom", "rs_source": "uncaught"}
+
+func test_error_rule_1_gameplay_before_captures() -> void:
+	var sdk := start()
+	sdk.track_event("a")
+	sdk.track_event("capture", CAPTURE)
+	sdk.track_event("b")
+	sdk.track_event("own_error", {"rs_kind": "error", "rs_severity": "error", "rs_message": "game", "rs_source": "manual"})
+	eq(queued_names(sdk), ["game_started", "a", "b", "own_error", "capture"], "gameplay, the game's own errors included, before captures")
+	sdk.answer(200, {"trackingEnabled": true})
+	sdk.answer(201, {"token": "t", "expiresIn": 86400})
+	eq(sdk.event_names(sdk.unanswered()[0]), ["game_started", "a", "b", "own_error", "capture"], "and so within the flush")
+	# A queue read from disk is ordered the same way.
+	_clean_storage()
+	var name := "ravensight/queue-%s.json" % Fake.fnv1a64_hex("gt_live_test")
+	_write(name, JSON.stringify({"version": 2, "groups": [{"events": [
+		{"event": "old_capture", "timestamp": 1800000000000, "data": CAPTURE},
+		{"event": "old_play", "timestamp": 1800000000001, "data": {}}]}]}))
+	var two := start()
+	eq(queued_names(two), ["game_started", "old_play", "old_capture"], "gameplay before captures after a load")
+
+func test_error_rule_2_full_queue() -> void:
+	var sdk := start({"max_queue_size": 4})
+	sdk.track_event("a")
+	sdk.track_event("c1", CAPTURE)
+	sdk.track_event("c2", CAPTURE)
+	eq(queued_names(sdk), ["game_started", "a", "c1", "c2"], "full")
+	sdk.track_event("c3", CAPTURE)
+	eq(queued_names(sdk), ["game_started", "a", "c2", "c3"], "an incoming capture evicts the oldest capture")
+	sdk.track_event("b")
+	sdk.track_event("c")
+	eq(queued_names(sdk), ["game_started", "a", "b", "c"], "gameplay behaves as before: captures go first")
+	sdk.track_event("c4", CAPTURE)
+	eq(queued_names(sdk), ["game_started", "a", "b", "c"], "with no capture queued, an incoming capture is dropped, never a gameplay event")
+
+func test_error_rule_3_trail_never_on_disk_and_optout_deletes() -> void:
+	var sdk := started_with_session()
+	var with_trail := CAPTURE.duplicate()
+	with_trail["rs_trail"] = "+0 info player entered cave"
+	sdk.track_event("capture", with_trail)
+	sdk._persist_queue()
+	var text := _read(_queue_file(sdk))
+	check(text.contains("capture"), "the capture is persisted")
+	check(not text.contains("rs_trail") and not text.contains("entered cave"), "its trail is not")
+	eq(sdk.pending_events.back()["data"].get("rs_trail"), "+0 info player entered cave", "the trail stays in memory for this run")
+	sdk.set_tracking_enabled(false)
+	eq(_read(_queue_file(sdk)), "", "opt-out deletes persisted captures")
+	sdk.set_tracking_enabled(true)
+	sdk.track_event("capture", CAPTURE)
+	sdk._persist_queue()
+	check(_read(_queue_file(sdk)).contains("capture"), "persisted again")
+	sdk.reset_device_id()
+	eq(_read(_queue_file(sdk)), "", "a device id reset deletes persisted captures")

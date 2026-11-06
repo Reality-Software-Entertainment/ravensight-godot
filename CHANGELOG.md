@@ -12,7 +12,7 @@ at release.
 - A 403 on a batch, and the kill switch, keep the queued events on disk for the next launch instead of discarding them.
 - A batch 401 opens a new session once (was twice), then waits for the backoff.
 - Backoff waits are multiplied by a random factor from 0.5 up to 1 (was plus or minus 20 percent).
-- A 400 that is not about one event (such as `invalid_json`) drops that request's events instead of halving.
+- Only `400 batch_too_large` and 413 halve a batch. Any other 400 without an `index` (such as `event_too_large` or `invalid_json`) drops that request's events instead of halving.
 
 ### Added
 
@@ -21,7 +21,7 @@ at release.
 - gzip for request bodies of 1,024 bytes or more; a 415, or a 413 for one compressed event, is resent uncompressed once (a 413 for one uncompressed event is dropped, as before).
 - Request signing (`X-Ravensight-Timestamp`, `X-Ravensight-Signature`) when the session answer has `signing`, with the clock corrected by `serverTime`. The secret is never written to disk.
 - A 400 with `index` drops only that event; `batch_too_large` halves the batch like a 413.
-- Gameplay events queue ahead of captured errors, and neither eviction nor that ordering ever moves an event in the batch in flight (which is removed by count when it is answered).
+- The shared error queue rules: gameplay events (a game's own `track_error` included) go before captured errors, also after the queue is read from disk; a capture evicts only the oldest capture, never a gameplay event; `rs_trail` is never written to the queue file; opting out or resetting the id deletes persisted captures. Neither eviction nor ordering moves an event in the batch in flight.
 - `track_ad()`, `track_ad_revenue()`, `micros_from_decimal_string()`, `micros_from_revenue()`, `set_attribution()` (once per install) and `get_device_id()`.
 - `rs_exposure`, sent once at a session's first exposure.
 - Device fields on the session: `model`, `osVersion` and `gpu`, as the engine reports them.

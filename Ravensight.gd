@@ -145,9 +145,6 @@ const MAX_EVENT_BYTES: int = 8192
 const MAX_DISTRIBUTION_LENGTH: int = 40
 const CONSENT_OPT_OUT := "opt_out"
 const CONSENT_OPT_IN := "opt_in"
-## 400 answers about one event that carry no index: the batch is halved
-## until that event is alone, rather than dropping the whole request.
-const PER_EVENT_400: Array[String] = ["event_too_large", "event_name_too_long", "missing_event", "invalid_event_data", "invalid_event_id"]
 ## Every request gives up after this long and counts as offline.
 const REQUEST_TIMEOUT_SECONDS: float = 15.0
 ## A batch 401 reopens the session at most this many times in a row; the
@@ -965,7 +962,12 @@ func _persist_queue(stopping: bool = false) -> void:
 				group["origin"] = origin
 			groups.append(group)
 			last_session = session
-		groups[-1]["events"].append({"event": e["event"], "timestamp": e["timestamp"], "data": e.get("data", {})})
+		var data: Dictionary = e.get("data", {})
+		if data.has("rs_trail"):
+			# A capture's trail is never written to the queue file.
+			data = data.duplicate()
+			data.erase("rs_trail")
+		groups[-1]["events"].append({"event": e["event"], "timestamp": e["timestamp"], "data": data})
 	DirAccess.make_dir_recursive_absolute(_path(QUEUE_DIR))
 	var tmp := path + ".tmp"
 	var file := FileAccess.open(_path(tmp), FileAccess.WRITE)
@@ -1016,7 +1018,11 @@ func _load_queue() -> void:
 			var data = ev.get("data")
 			loaded.append({"event": ev["event"], "data": data if data is Dictionary else {}, "timestamp": timestamp, "_origin": origin})
 	_delivery_stats["dropped_too_old"] += too_old
-	pending_events = loaded + pending_events
+	# Gameplay goes before captured errors (nothing is in flight yet).
+	var combined: Array = loaded + pending_events
+	var gameplay: Array = combined.filter(func(e): return not (e.get("data") is Dictionary and _is_captured_error(e["data"])))
+	var captures: Array = combined.filter(func(e): return e.get("data") is Dictionary and _is_captured_error(e["data"]))
+	pending_events = gameplay + captures
 	if _session_boundary > 0:
 		_session_boundary += loaded.size()
 	_trim_queue()
@@ -2817,10 +2823,8 @@ func _on_batch_response(code: int, headers: PackedStringArray, body: PackedByteA
 ##   is still too large is dropped;
 ## - a 415 (or a 413 for one compressed event): sent once more uncompressed,
 ##   then dropped;
-## - a 400 for one event that carries no index (event_too_large and the
-##   other per-event ceilings): the batch is halved until that event is
-##   alone, then it is dropped;
-## - any other 400: the request's events are dropped.
+## - any other 400: the request's events are dropped (one event or many;
+##   only batch_too_large and 413 halve a batch).
 ## Every dropped event is logged once and counted as dropped_refused.
 func _on_batch_refused(code: int, error: String, parsed: Variant, batch_size: int) -> void:
 	var reason := error if not error.is_empty() else "http_%d" % code
@@ -2840,7 +2844,7 @@ func _on_batch_refused(code: int, error: String, parsed: Variant, batch_size: in
 		_drop_front(batch_size)
 		_count_refused(batch_size, reason)
 		return
-	var halves := code == 413 or error == "batch_too_large" or (code == 400 and PER_EVENT_400.has(error))
+	var halves := code == 413 or error == "batch_too_large"
 	if halves and batch_size > 1:
 		_split_batch_size = maxi(1, batch_size / 2)
 		push_warning("Ravensight: batch refused (%s), splitting to %d" % [reason, _split_batch_size])
