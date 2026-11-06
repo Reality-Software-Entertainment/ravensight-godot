@@ -122,6 +122,7 @@ func _run() -> void:
 		"test_boot_errors_dropped_on_exit",
 		"test_printed_lines_never_evict_errors",
 		"test_shared_scrub_vectors",
+		"test_scrub_cuts_long_input_fast",
 	]
 	for name in tests:
 		_current = name
@@ -1891,3 +1892,18 @@ func test_shared_scrub_vectors() -> void:
 	for c in doc["cases"]:
 		eq(sdk._scrub(str(c["in"])), str(c["out"]), "vector '%s'" % c["name"])
 	sdk.free()
+
+func test_scrub_cuts_long_input_fast() -> void:
+	var sdk := make()
+	for blob in ["a1/".repeat(66667), "1:".repeat(100000), "x@".repeat(100000), "https://u:p@".repeat(20000)]:
+		var started := Time.get_ticks_msec()
+		var out := sdk._scrub(blob, MAX_STACK)
+		var took := Time.get_ticks_msec() - started
+		check(took < 1000, "200,000 characters scrub fast (%d ms)" % took)
+		check(out.length() <= MAX_STACK, "the result is cut to the limit")
+	eq(sdk._scrub("m".repeat(500), 200).length(), 200, "cut to the field limit after scrubbing")
+	# Cut to 4 times the limit before scrubbing: a token past it is never read.
+	eq(sdk._scrub("ok " + "x".repeat(900) + " gt_live_abc", 200), "ok " + "x".repeat(197), "input past 4 times the limit is dropped first")
+	sdk.free()
+
+const MAX_STACK := 2000

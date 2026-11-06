@@ -1548,7 +1548,7 @@ func _capture_logged_error(entry: Dictionary) -> void:
 	# The caps come before the scrub, so a flood costs no scrub work.
 	var key := "%s|%s|%s" % [error_type, _message_template(message), first_frame]
 	if _allow_capture(key):
-		var scrubbed := _scrub(message)
+		var scrubbed := _scrub(message, MAX_ERROR_MESSAGE_CHARS)
 		var props := {
 			"rs_kind": "error",
 			"rs_severity": "error" if is_script else "warning",
@@ -1557,7 +1557,7 @@ func _capture_logged_error(entry: Dictionary) -> void:
 			"rs_message": scrubbed.substr(0, MAX_ERROR_MESSAGE_CHARS),
 		}
 		if not stack_lines.is_empty():
-			props["rs_stack"] = _scrub("\n".join(stack_lines)).substr(0, MAX_ERROR_STACK_CHARS)
+			props["rs_stack"] = _scrub("\n".join(stack_lines), MAX_ERROR_STACK_CHARS)
 		if _error_trail_enabled and not _trail.is_empty() and _trails_sent < ERROR_CAPTURE_MAX_TRAILS:
 			_trails_sent += 1
 			props["rs_trail"] = _trail_text()
@@ -1603,7 +1603,7 @@ func _reset_error_session() -> void:
 func _trail_add(ms: int, level: String, text: String) -> void:
 	if _error_logger == null or not _error_trail_enabled:
 		return
-	var line := "+%d %s %s" % [maxi(0, ms - _session_start_ms), level, _scrub(text.replace("\n", " ").replace("\r", " ").strip_edges())]
+	var line := "+%d %s %s" % [maxi(0, ms - _session_start_ms), level, _scrub(text.replace("\n", " ").replace("\r", " ").strip_edges(), TRAIL_LINE_CHARS)]
 	_trail.append(line.substr(0, TRAIL_LINE_CHARS))
 	while _trail.size() > TRAIL_LINES:
 		_trail.pop_front()
@@ -1628,10 +1628,13 @@ func _first_captured_error_index() -> int:
 	return -1
 
 ## The contract's scrub, applied on the device before anything is queued.
-func _scrub(text: String) -> String:
+## The input is cut to 4 times `limit` first (some rules are slow on long
+## input) and the result to `limit`.
+func _scrub(text: String, limit: int = MAX_ERROR_STACK_CHARS) -> String:
 	if _scrub_rules.is_empty():
 		var rules := [
-			# A URL loses its query and fragment.
+			# A URL loses any user:password@, then its query and fragment.
+			["(\\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^\\s/?#@]*@", "$1"],
 			["(\\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\\s?#]*)[?#][^\\s]*", "$1"],
 			["[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[email]"],
 			["(?i)\\bbearer\\s+[A-Za-z0-9._~+/=-]+", "[token]"],
@@ -1640,24 +1643,47 @@ func _scrub(text: String) -> String:
 			# Long base64 or hex runs: see _scrub_long_runs(), between these.
 			["", ""],
 			["\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b", "[ip]"],
-			# IPv6: the full eight groups, or a compressed form with "::".
-			["(?i)\\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\\b|\\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4}\\b|(?<![\\w:])::1\\b", "[ip]"],
+			# IPv6: the full eight groups, or a compressed form with "::". A
+			# match needs a digit, so a C++ scope such as Face::Add stays.
+			["ipv6:(?i)\\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\\b|\\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4}\\b|(?<![\\w:])::1\\b", "[ip]"],
 			["/Users/[^/\\s]+", "~"],
 			["/home/[^/\\s]+", "~"],
 			["(?i)[A-Z]:\\\\Users\\\\[^\\\\\\s]+", "~"],
 		]
 		for r in rules:
 			var re := RegEx.new()
-			if not r[0].is_empty():
-				re.compile(r[0])
-			_scrub_rules.append([re, r[1]])
-	var out := text
+			var pattern: String = r[0]
+			var needs_digit := pattern.begins_with("ipv6:")
+			if needs_digit:
+				pattern = pattern.substr(5)
+			if not pattern.is_empty():
+				re.compile(pattern)
+			_scrub_rules.append([re, r[1], needs_digit])
+	var out := text.substr(0, limit * 4)
 	for rule in _scrub_rules:
 		if rule[1] == "":
 			out = _scrub_long_runs(out)
+		elif rule[2]:
+			out = _replace_with_digit(out, rule[0], rule[1])
 		else:
 			out = (rule[0] as RegEx).sub(out, rule[1], true)
-	return out
+	return out.substr(0, limit)
+
+## Replaces each match of `re` that contains a digit.
+func _replace_with_digit(text: String, re: RegEx, replacement: String) -> String:
+	var out := ""
+	var at := 0
+	for m in re.search_all(text):
+		var hit := m.get_string()
+		out += text.substr(at, m.get_start() - at)
+		var has_digit := false
+		for ch in hit:
+			if ch >= "0" and ch <= "9":
+				has_digit = true
+				break
+		out += replacement if has_digit else hit
+		at = m.get_end()
+	return out + text.substr(at)
 
 ## A run of 32 or more base64 characters with a digit becomes [token],
 ## unless it is a path: it has a "/" and every piece between slashes is
@@ -1709,7 +1735,7 @@ func _message_template(message: String) -> String:
 			var re := RegEx.new()
 			re.compile(pair[0])
 			_template_rules.append([re, pair[1]])
-	var out := message
+	var out := message.substr(0, MAX_ERROR_MESSAGE_CHARS * 4)
 	for rule in _template_rules:
 		out = (rule[0] as RegEx).sub(out, rule[1], true)
 	return out

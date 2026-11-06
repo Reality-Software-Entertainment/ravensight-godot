@@ -350,7 +350,7 @@ captured. Messages, stacks and the trail are scrubbed on the device before
 they are queued: email addresses become `[email]`, tokens, `gt_` keys and
 long base64 or hex runs with a digit become `[token]` (a file path such as
 `res://addons/inventory2/slot.gd` is kept), IP addresses become `[ip]`, home
-folders become `~`, and a URL loses its query and fragment.
+folders become `~`, and a URL loses any `user:password@`, its query and its fragment.
 
 **Bounded spend.** One captured error is one event on your usage meter.
 Each session captures at most 30 errors, 3 of the same error (same type,
