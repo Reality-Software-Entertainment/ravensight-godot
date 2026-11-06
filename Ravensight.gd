@@ -947,7 +947,7 @@ func _persist_queue(stopping: bool = false) -> void:
 		return
 	var path := _queue_path()
 	if pending_events.is_empty():
-		_remove_file(path)
+		_remove_queue_files(path)
 		return
 	var groups: Array = []
 	var last_session = null
@@ -977,6 +977,11 @@ func _persist_queue(stopping: bool = false) -> void:
 	file.close()
 	if DirAccess.rename_absolute(_path(tmp), _path(path)) != OK:
 		_remove_file(tmp)
+
+## Deletes the queue file and any temporary file a write left behind.
+func _remove_queue_files(path: String) -> void:
+	_remove_file(path)
+	_remove_file(path + ".tmp")
 
 ## Reads the queue once, when sending starts: its events go ahead of
 ## anything queued this run. A missing, unreadable, malformed or unknown
@@ -2439,7 +2444,7 @@ func _clear_queue(forget: bool = false) -> void:
 	_first_queued_at = -1.0
 	_queue_loaded = false
 	if forget and _persist_enabled():
-		_remove_file(_queue_path())
+		_remove_queue_files(_queue_path())
 
 ## The kill switch is off (settings said so, or a 403 tracking_disabled):
 ## final for the rest of the run. Nothing is queued, sent or retried.

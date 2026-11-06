@@ -129,6 +129,7 @@ func _run() -> void:
 		"test_error_rule_2_full_queue",
 		"test_error_rule_3_trail_never_on_disk_and_optout_deletes",
 		"test_error_rule_inflight_never_evicted",
+		"test_queue_temp_file_never_left_behind",
 		"test_fnv_queue_file_name",
 		"test_queue_persisted_with_origin_and_replayed",
 		"test_queue_kept_until_2xx_and_removal_saved_first",
@@ -2518,3 +2519,34 @@ func test_error_rule_inflight_never_evicted() -> void:
 	full.track_event("z")
 	full.track_event("w", CAPTURE)
 	eq(queued_names(full), ["y", "x"], "nothing in flight is evicted, the incoming events are dropped")
+
+func test_queue_temp_file_never_left_behind() -> void:
+	var sdk := started_with_session()
+	var name := _queue_file(sdk)
+	sdk.track_event("a")
+	sdk._persist_queue()
+	# A write that died between the temporary file and the rename.
+	_write(name + ".tmp", "{\"partial")
+	sdk.set_tracking_enabled(false)
+	eq(_read(name), "", "opt-out deletes the queue file")
+	eq(_read(name + ".tmp"), "", "and the leftover temporary file")
+	sdk.set_tracking_enabled(true)
+	sdk.track_event("b")
+	sdk._persist_queue()
+	_write(name + ".tmp", "{\"partial")
+	sdk.reset_device_id()
+	eq(_read(name + ".tmp"), "", "a device id reset deletes it too")
+	sdk.track_event("c")
+	sdk._persist_queue()
+	_write(name + ".tmp", "{\"partial")
+	sdk.flush()
+	sdk.answer_all_ok()
+	eq(_read(name), "", "an emptied queue deletes the file")
+	eq(_read(name + ".tmp"), "", "and the leftover temporary file")
+	# A rename that fails (a folder sits where the file goes) deletes its
+	# temporary file.
+	DirAccess.make_dir_recursive_absolute(_file(name))
+	sdk.track_event("d")
+	sdk._persist_queue()
+	check(not FileAccess.file_exists(_file(name + ".tmp")), "a failed rename leaves no temporary file")
+	DirAccess.remove_absolute(_file(name))
