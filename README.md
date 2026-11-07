@@ -304,7 +304,7 @@ key and none of these options.
 | 0.2.0 | 4.x (CI on 4.5-stable) | `/api/v1` | The shared SDK contract. |
 | Unreleased | 4.x, error capture on 4.5+ (CI on 4.5-stable) | `/api/v1` | Automatic error capture needs the API's error capture support; turn it off with `error_capture = false` against an older API. |
 | 0.3.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
-| After 0.4.0 (unreleased) | 4.x (CI on 4.5-stable) | `/api/v1` | Saved queue, origin, gzip and signing, ads and attribution, exposure tagging, device fields. Needs a Ravensight server that keeps millisecond timestamps, accepts `origin`, gzip and signatures, and knows the `rs_ad_*` and `rs_attr_*` keys. |
+| 0.5.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Saved queue, origin, gzip and signing, ads and attribution, exposure tagging, device fields. Needs a Ravensight server that keeps millisecond timestamps, accepts `origin`, gzip and signatures, and knows the `rs_ad_*` and `rs_attr_*` keys. |
 
 ## Levels and deaths
 
