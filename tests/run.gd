@@ -46,7 +46,7 @@ func _run() -> void:
 		"test_batch_400_split",
 		"test_batching_window_and_batch_of_50",
 		"test_queue_cap_500_keeps_game_started",
-		"test_batch_401_reopens_twice_then_backs_off",
+		"test_batch_401_reopens_once_then_backs_off",
 		"test_feedback_validation",
 		"test_playtest_header_id_and_no_writes",
 		"test_playtest_job_closed_stops",
@@ -123,7 +123,44 @@ func _run() -> void:
 		"test_printed_lines_never_evict_errors",
 		"test_shared_scrub_vectors",
 		"test_scrub_cuts_long_input_fast",
+		"test_event_timestamps_are_milliseconds",
+		"test_cold_launch_marker_in_milliseconds",
+		"test_error_rule_1_gameplay_before_captures",
+		"test_error_rule_2_full_queue",
+		"test_error_rule_3_trail_never_on_disk_and_optout_deletes",
+		"test_error_rule_inflight_never_evicted",
+		"test_queue_temp_file_never_left_behind",
+		"test_fnv_queue_file_name",
+		"test_queue_persisted_with_origin_and_replayed",
+		"test_queue_kept_until_2xx_and_removal_saved_first",
+		"test_queue_file_unreadable_or_old_version",
+		"test_queue_age_and_cap",
+		"test_queue_forgotten_on_optout_and_reset_kept_on_403",
+		"test_400_with_index_drops_that_event",
+		"test_400_batch_too_large_halves_other_400_drops",
+		"test_415_resends_uncompressed_once_then_drops",
+		"test_413_splits_the_batch",
+		"test_gzip_from_1024_bytes",
+		"test_signing_vectors",
+		"test_signed_batch_uses_server_clock",
+		"test_event_size_vectors",
+		"test_full_queue_evicts_automatic_errors_first",
+		"test_json_escapes_control_characters",
+		"test_device_fields_on_session",
+		"test_background_marker_replays_through_queue_with_origin",
+		"test_ad_revenue_conformance",
+		"test_micros_without_float_multiply",
+		"test_attribution_once_per_install",
+		"test_exposure_fetch_alone_tags_nothing",
+		"test_exposure_first_read_tags_later_events",
+		"test_exposure_new_session_starts_untagged",
+		"test_exposure_stopped_experiment_untagged",
+		"test_exposure_offline_event_keeps_tag",
 	]
+	# RAVENSIGHT_TEST=name1,name2 runs only those tests.
+	var only := OS.get_environment("RAVENSIGHT_TEST")
+	if not only.is_empty():
+		tests = tests.filter(func(t): return only.split(",").has(t))
 	for name in tests:
 		_current = name
 		_clean_storage()
@@ -158,10 +195,11 @@ func eq(actual: Variant, expected: Variant, what: String) -> void:
 		_failures.append("%s: %s (expected %s, got %s)" % [_current, what, str(expected), str(actual)])
 
 func _clean_storage() -> void:
-	DirAccess.make_dir_recursive_absolute(Fake.TEST_STORAGE_DIR)
-	var dir := DirAccess.open(Fake.TEST_STORAGE_DIR)
-	for f in dir.get_files():
-		dir.remove(f)
+	for folder in [Fake.TEST_STORAGE_DIR, Fake.TEST_STORAGE_DIR + "ravensight/"]:
+		DirAccess.make_dir_recursive_absolute(folder)
+		var dir := DirAccess.open(folder)
+		for f in dir.get_files():
+			dir.remove(f)
 
 func _file(name: String) -> String:
 	return Fake.TEST_STORAGE_DIR + name
@@ -238,7 +276,7 @@ func test_api_base_forms() -> void:
 	eq(fresh.api_url, "https://api.ravensight.io", "default api_url is the bare host")
 	eq(Fake.REQUEST_TIMEOUT_SECONDS, 15.0, "request timeout")
 	eq(fresh.max_queue_size, 500, "default queue cap")
-	eq(Fake.VERSION, "0.4.0", "version constant")
+	eq(Fake.VERSION, "0.5.0", "version constant")
 	var plain: Node = load("res://Ravensight.gd").new()
 	eq(plain.ingest_key, "", "default ingest_key is empty")
 	eq(plain.consent, "opt_out", "default consent")
@@ -476,12 +514,14 @@ func test_offline_backoff() -> void:
 	eq(sdk.pending_events.size(), 0, "events kept and delivered")
 
 func test_batch_400_split() -> void:
+	# Only batch_too_large (and a 413) halve a batch; any other 400 without an
+	# index drops the request's events.
 	var sdk := started_with_session()
 	for i in 4:
 		sdk.track_event("e%d" % i)
 	sdk.flush()
 	var sizes := []
-	# e2 is the poison event: every batch containing it gets a 400.
+	# e2 is the poison event: a batch holding it is too large.
 	for i in 20:
 		var open := sdk.unanswered()
 		if open.is_empty():
@@ -489,13 +529,18 @@ func test_batch_400_split() -> void:
 		var names: Array = sdk.event_names(open[0])
 		sizes.append(names.size())
 		if names.has("e2"):
-			sdk.answer(400, {"error": "event_too_large"})
+			sdk.answer(400, {"error": "batch_too_large"})
 		else:
 			sdk.answer(202, {})
 	eq(sizes, [4, 2, 2, 1, 1], "halved until the bad event is alone, then the rest")
 	eq(sdk.pending_events.size(), 0, "queue drained")
-	check(signal_args("flush_failed").has("event_too_large"), "the drop is reported on flush_failed")
+	check(signal_args("flush_failed").has("batch_too_large"), "the drop is reported on flush_failed")
 	eq(signal_args("events_flushed"), [1, 2, 1], "game_started, then the other three are delivered")
+	sdk.track_event("x")
+	sdk.track_event("y")
+	sdk.flush()
+	sdk.answer(400, {"error": "event_too_large"})
+	eq(sdk.pending_events.size(), 0, "a 400 about one event with no index drops the request")
 
 func test_batching_window_and_batch_of_50() -> void:
 	var sdk := started_with_session()
@@ -531,20 +576,17 @@ func test_queue_cap_500_keeps_game_started() -> void:
 	eq(sdk.pending_events[1]["event"], "e101", "oldest after it dropped")
 	eq(sdk.pending_events[499]["event"], "e599", "newest kept")
 
-func test_batch_401_reopens_twice_then_backs_off() -> void:
+func test_batch_401_reopens_once_then_backs_off() -> void:
 	var sdk := started_with_session()
 	sdk.track_event("x")
 	sdk.flush()
-	sdk.answer(401, {"error": "invalid_session"})
+	sdk.answer(401, {"error": "signature_expired"})
 	sdk.answer(201, {"token": "t2", "expiresIn": 86400})
 	sdk.answer(401, {"error": "invalid_session"})
 	sdk.answer(304, "") # The config request from t2.
-	sdk.answer(201, {"token": "t3", "expiresIn": 86400})
-	sdk.answer(401, {"error": "invalid_session"})
-	sdk.answer(304, "") # The config request from t3.
 	var tail: Array = sdk.paths().slice(4)
-	eq(tail, ["/track/batch", "/session", "/track/batch", "/ingest/config", "/session", "/track/batch", "/ingest/config"], "two reopens, then stop")
-	eq(sdk.unanswered().size(), 0, "no third reopen at once")
+	eq(tail, ["/track/batch", "/session", "/track/batch", "/ingest/config"], "one reopen, then stop")
+	eq(sdk.unanswered().size(), 0, "no second reopen at once")
 	sdk.advance(10.0)
 	eq(sdk.unanswered().size(), 1, "the backoff takes over")
 	eq(queued_names(sdk), ["x"], "the event is kept")
@@ -714,6 +756,7 @@ func test_mobile_background_under_timeout() -> void:
 	if marker is Dictionary:
 		eq(marker["sessionToken"], sdk.session_token, "marker token")
 		eq(int(marker["backgroundedAt"]), sdk.fake_unix, "marker time")
+		eq(int(marker["backgroundedAtMs"]), sdk.fake_unix * 1000, "marker time in milliseconds")
 		eq(int(marker["expiresAt"]), sdk.session_expires_at, "marker expiry")
 	sdk.answer_all_ok()
 	sdk.fake_unix += 1799
@@ -731,7 +774,7 @@ func test_mobile_background_past_timeout() -> void:
 	sdk.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
 	var exit_req: Dictionary = sdk.unanswered()[0]
 	eq(sdk.event_names(exit_req), ["game_exited"], "game_exited sent first, alone")
-	eq(int(sdk.events_in(exit_req)[0]["timestamp"]), backgrounded_at, "at the moment it went to the background")
+	eq(int(sdk.events_in(exit_req)[0]["timestamp"]), backgrounded_at * 1000, "at the moment it went to the background")
 	eq(sdk.header(exit_req, "X-Session-Token"), old_token, "under the old session")
 	sdk.answer(202, {})
 	eq(sdk.unanswered()[0]["path"], "/session", "then a new session opens")
@@ -739,12 +782,31 @@ func test_mobile_background_past_timeout() -> void:
 	var start_req: Dictionary = sdk.unanswered()[0]
 	eq(sdk.event_names(start_req), ["game_started"], "game_started in the new session")
 	eq(sdk.header(start_req, "X-Session-Token"), "fresh", "under the new token")
-	eq(int(sdk.events_in(start_req)[0]["timestamp"]), sdk.fake_unix, "at the return time")
+	eq(int(sdk.events_in(start_req)[0]["timestamp"]), sdk.fake_unix * 1000, "at the return time")
 	sdk.answer(202, {})
 	sdk.quit()
 	sdk.answer_all_ok()
 	var exits := sent_count(sdk, "game_exited")
 	eq(exits, 2, "the new session gets its own game_exited on quit")
+
+func test_event_timestamps_are_milliseconds() -> void:
+	var sdk := start()
+	sdk.fake_ms = 200
+	sdk.track_event("first")
+	sdk.fake_ms = 700
+	sdk.track_event("second")
+	var stamps := {}
+	for event in sdk.pending_events:
+		stamps[event["event"]] = int(event["timestamp"])
+	eq(stamps["first"], sdk.fake_unix * 1000 + 200, "the first event keeps its milliseconds")
+	eq(stamps["second"], sdk.fake_unix * 1000 + 700, "and the second, in the same second, its own")
+	var wire: Variant = JSON.parse_string(JSON.stringify({"timestamp": stamps["second"]}))
+	eq(int(wire["timestamp"]), sdk.fake_unix * 1000 + 700, "a millisecond timestamp survives the JSON a batch is sent as")
+
+func test_cold_launch_marker_in_milliseconds() -> void:
+	_write("ravensight_bg.save", JSON.stringify({"sessionToken": "old_tok", "expiresAt": 1800000000 + 3600, "backgroundedAt": 1800000000 - 50, "backgroundedAtMs": 1799999950250}))
+	var sdk := start()
+	eq(int(sdk.events_in(sdk.requests[0])[0]["timestamp"]), 1799999950250, "the marker's milliseconds win")
 
 func test_cold_launch_marker() -> void:
 	_write("ravensight_bg.save", JSON.stringify({"sessionToken": "old_tok", "expiresAt": 1800000000 + 3600, "backgroundedAt": 1800000000 - 50}))
@@ -821,13 +883,13 @@ func test_later_enable_stamps_game_started_now() -> void:
 	var sdk := start({"enabled": false})
 	sdk.fake_unix += 120
 	sdk.set_enabled(true)
-	eq(int(sdk.pending_events[0]["timestamp"]), sdk.fake_unix, "game_started carries the time it was enabled")
+	eq(int(sdk.pending_events[0]["timestamp"]), sdk.fake_unix * 1000, "game_started carries the time it was enabled")
 
 	_write("ravensight_optout.save", "1")
 	var opted := start()
 	opted.fake_unix += 300
 	opted.set_tracking_enabled(true)
-	eq(int(opted.pending_events[0]["timestamp"]), opted.fake_unix, "and the time the player opted in")
+	eq(int(opted.pending_events[0]["timestamp"]), opted.fake_unix * 1000, "and the time the player opted in")
 
 	var quitter := make()
 	quitter.quit()
@@ -995,24 +1057,24 @@ func test_batch_403_ends_run() -> void:
 	eq(sdk.requests.size(), n, "nothing more is sent")
 
 func test_jitter_bounds() -> void:
-	# The lowest draw: 10 s less 20 percent.
+	# The lowest draw: half of 10 s.
 	var low := start()
 	low.fake_random = 0.0
 	low.answer(200, {"trackingEnabled": true})
 	low.answer(0, "")
-	low.advance(7.9)
-	eq(low.unanswered().size(), 0, "not before 8 s")
+	low.advance(4.9)
+	eq(low.unanswered().size(), 0, "not before 5 s")
 	low.advance(0.2)
-	eq(low.unanswered().size(), 1, "retried by 8.1 s")
-	# The highest draw: 10 s plus 20 percent.
+	eq(low.unanswered().size(), 1, "retried by 5.1 s")
+	# The highest draw: just under 10 s, never more.
 	var high := start()
 	high.fake_random = 0.999999
 	high.answer(200, {"trackingEnabled": true})
 	high.answer(0, "")
-	high.advance(11.9)
-	eq(high.unanswered().size(), 0, "not before 11.9 s")
-	high.advance(0.2)
-	eq(high.unanswered().size(), 1, "retried by 12.1 s")
+	high.advance(9.9)
+	eq(high.unanswered().size(), 0, "not before 9.9 s")
+	high.advance(0.1)
+	eq(high.unanswered().size(), 1, "retried by 10 s")
 	# Spread never passes the 5 minute cap.
 	var capped := start()
 	capped.fake_random = 0.999999
@@ -1023,6 +1085,17 @@ func test_jitter_bounds() -> void:
 	capped.answer(0, "")
 	capped.advance(300.0)
 	eq(capped.unanswered().size(), 1, "a capped wait is at most 300 s")
+	var half := start()
+	half.fake_random = 0.0
+	half.answer(200, {"trackingEnabled": true})
+	for i in 8:
+		half.answer(0, "")
+		half.advance(400.0)
+	half.answer(0, "")
+	half.advance(149.0)
+	eq(half.unanswered().size(), 0, "a capped wait is at least 150 s")
+	half.advance(1.0)
+	eq(half.unanswered().size(), 1, "and the lowest is exactly half of 300 s")
 
 func test_retry_after_not_jittered() -> void:
 	var sdk := start()
@@ -1110,7 +1183,7 @@ func test_default_key_only_unchanged() -> void:
 	eq(files, ["device_id.save"], "only the device id file, as in 0.2.0")
 	eq(sdk.paths(), ["/settings", "/session", "/track/batch", "/ingest/config"], "settings, session, batch")
 	var body = JSON.parse_string(sdk.requests[1]["body"])
-	eq(body.keys().size(), 4, "the session body includes the SDK version")
+	eq(body.keys().size(), 5, "the session body includes the SDK version and the device fields")
 # --- typed events and health --------------------------------------------------
 
 ## The data of the last event queued.
@@ -1127,7 +1200,7 @@ func test_session_request_carries_sdk() -> void:
 	var sdk := start()
 	sdk.answer(200, {"trackingEnabled": true})
 	var body = JSON.parse_string(sdk.requests[1]["body"])
-	eq(body["sdk"], "godot/0.4.0", "sdk name and version on session create")
+	eq(body["sdk"], "godot/0.5.0", "sdk name and version on session create")
 
 func test_track_purchase_properties() -> void:
 	var sdk := start()
@@ -1345,7 +1418,9 @@ func test_config_cache_and_exposure() -> void:
 	rules["bonus"] = 99
 	eq(sdk.get_config("rules", {})["bonus"], 2.0, "copy isolation")
 	sdk.track_event("level", {"rs_exp_difficulty": "forged"})
-	eq(sdk.pending_events.back()["data"]["rs_exp_difficulty"], "easy", "assignment overrides caller")
+	eq(sdk.pending_events.back()["data"]["rs_exp_difficulty"], "forged", "a well-formed value the game set is left alone")
+	sdk.track_event("level", {"rs_exp_difficulty": "Not Valid!"})
+	eq(sdk.pending_events.back()["data"]["rs_exp_difficulty"], "easy", "a malformed value the game set is replaced")
 	sdk.fetch_config()
 	eq(sdk.header(sdk.unanswered()[0], "If-None-Match"), _config_doc()["etag"], "ETag reused")
 	sdk.answer(304, "")
@@ -1907,3 +1982,571 @@ func test_scrub_cuts_long_input_fast() -> void:
 	sdk.free()
 
 const MAX_STACK := 2000
+
+# --- delivery contract: persisted queue, origin, signing, gzip, refusals -------
+
+const ORIGIN_A := {"session": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "build": "1.0.0", "platform": "macOS", "stamp": "o1.aaa.bbb"}
+const ORIGIN_B := {"session": "ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "build": "1.1.0", "platform": "macOS", "stamp": "o1.ccc.ddd"}
+
+func _queue_file(sdk: Fake) -> String:
+	return "ravensight/queue-%s.json" % Fake.fnv1a64_hex(sdk.ingest_key)
+
+func _queue_doc(sdk: Fake) -> Variant:
+	var text := _read(_queue_file(sdk))
+	return JSON.parse_string(text) if not text.is_empty() else null
+
+## Started, settings on, a session that answers with `answer_extra` merged in.
+func started_with_origin(origin: Dictionary, extra: Dictionary = {}, props: Dictionary = {}) -> Fake:
+	var sdk := start(props)
+	sdk.answer(200, {"trackingEnabled": true})
+	var answer := {"token": "tok_o", "expiresIn": 86400, "origin": origin}
+	answer.merge(extra, true)
+	sdk.answer(201, answer)
+	return sdk
+
+func _vectors() -> Dictionary:
+	return JSON.parse_string(FileAccess.get_file_as_string("res://tests/delivery-vectors.json"))
+
+## {repeat, count} in a vector is the string repeated count times.
+func _expand(value: Variant) -> Variant:
+	if value is Dictionary and value.has("repeat"):
+		return str(value["repeat"]).repeat(int(value["count"]))
+	if value is Dictionary:
+		var out := {}
+		for k in value:
+			out[k] = _expand(value[k])
+		return out
+	return value
+
+func test_fnv_queue_file_name() -> void:
+	eq(Fake.fnv1a64_hex(""), "cbf29ce484222325", "FNV-1a 64 of the empty string")
+	eq(Fake.fnv1a64_hex("a"), "af63dc4c8601ec8c", "FNV-1a 64 of a")
+	eq(Fake.fnv1a64_hex("gt_live_test"), "094acf328fe638e2", "FNV-1a 64 of the test key")
+	eq(Fake.fnv1a64_hex("gt_pub_é"), "853d257447c0bc87", "hashed over UTF-8 bytes")
+	var sdk := start()
+	eq(sdk._queue_path(), "user://ravensight/queue-094acf328fe638e2.json", "one file per key, named by the hash")
+
+func test_queue_persisted_with_origin_and_replayed() -> void:
+	var one := started_with_origin(ORIGIN_A, {"signing": {"algorithm": "HMAC-SHA256", "version": 1, "secret": "s3cret-value", "serverTime": 1800000000}})
+	one.track_event("pickup", {"n": 1})
+	one._persist_queue()
+	var doc = _queue_doc(one)
+	check(doc is Dictionary, "the queue is on disk")
+	eq(doc["version"], 2.0, "format version 2")
+	eq(doc["groups"].size(), 1, "one session, one group")
+	eq(doc["groups"][0]["origin"], ORIGIN_A, "the origin as received")
+	eq(doc["groups"][0]["events"].map(func(e): return e["event"]), ["game_started", "pickup"], "both events")
+	check(not _read(_queue_file(one)).contains("s3cret-value"), "the signing secret is never written")
+	check(not _read(_queue_file(one)).contains("tok_o"), "the session token is not written")
+	var first_ids: Array = doc["groups"][0]["events"].map(func(e): return e["data"]["rs_event_id"])
+	var pickup_ts = doc["groups"][0]["events"][1]["timestamp"]
+	# The process dies; the next launch opens a new session.
+	root.remove_child(one)
+	one.free()
+	var two := started_with_origin(ORIGIN_B)
+	var batch: Array = two.events_in(two.unanswered()[0])
+	eq(batch.map(func(e): return e["event"]), ["game_started", "game_started", "pickup"], "this run's game_started, then the old run's events")
+	eq(batch[0].has("origin"), false, "this session's events carry no origin")
+	eq(batch[1].get("origin"), ORIGIN_A, "an earlier session's event carries its origin verbatim")
+	eq(batch[2].get("origin"), ORIGIN_A, "on every event of the group")
+	eq([batch[1]["data"]["rs_event_id"], batch[2]["data"]["rs_event_id"]], first_ids, "the same rs_event_id on the resend")
+	eq(batch[2]["timestamp"], pickup_ts, "the original timestamp")
+	for e in batch:
+		for k in e.keys():
+			check(k in ["event", "data", "timestamp", "origin"], "only the four wire fields: %s" % k)
+	two.answer(202, {"accepted": 3})
+	eq(_read(_queue_file(two)), "", "delivered: the file is gone")
+
+func test_queue_kept_until_2xx_and_removal_saved_first() -> void:
+	var sdk := started_with_origin(ORIGIN_A)
+	sdk.answer(202, {})
+	sdk.answer(304, "")
+	sdk.track_event("a")
+	sdk.track_event("b")
+	sdk._persist_queue()
+	sdk.flush()
+	sdk.answer(500, {"error": "internal_error"})
+	eq(_queue_doc(sdk)["groups"][0]["events"].size(), 2, "a 5xx keeps the events on disk")
+	sdk.advance(10.0)
+	sdk.answer(429, {"error": "rate_limited"}, ["Retry-After: 5"])
+	eq(_queue_doc(sdk)["groups"][0]["events"].size(), 2, "a 429 keeps them")
+	sdk.advance(5.0)
+	sdk.answer(202, {})
+	eq(_queue_doc(sdk), null, "a 2xx removes them and saves the removal")
+
+func test_queue_file_unreadable_or_old_version() -> void:
+	var probe := make()
+	var name := "ravensight/queue-%s.json" % Fake.fnv1a64_hex(probe.ingest_key)
+	probe.free()
+	for text in ["not json", "{\"version\": 9, \"groups\": []}", "[]", "{\"version\": 2}"]:
+		_clean_storage()
+		_write(name, text)
+		var sdk := start()
+		eq(queued_names(sdk), ["game_started"], "an unusable file is an empty queue: %s" % text)
+		root.remove_child(sdk)
+		sdk.free()
+	_clean_storage()
+	# Version 1: groups without an origin.
+	_write(name, JSON.stringify({"version": 1, "groups": [{"origin": ORIGIN_A, "events": [{"event": "v1", "timestamp": 1800000000000, "data": {"rs_event_id": "x1"}}]}]}))
+	var v1 := started_with_origin(ORIGIN_B)
+	var batch: Array = v1.events_in(v1.unanswered()[0])
+	eq(batch.map(func(e): return e["event"]), ["game_started", "v1"], "a version 1 event is read")
+	eq(batch[1].has("origin"), false, "with no origin, so it joins this session")
+	v1._persist_queue()
+	eq(_queue_doc(v1)["version"], 2.0, "the next write is version 2")
+
+func test_queue_age_and_cap() -> void:
+	var probe := make()
+	var name := "ravensight/queue-%s.json" % Fake.fnv1a64_hex(probe.ingest_key)
+	var now_ms: int = probe._unix_now_ms()
+	probe.free()
+	var events: Array = []
+	for i in 3:
+		events.append({"event": "ancient%d" % i, "timestamp": now_ms - 90 * 86400 * 1000, "data": {}})
+	# A seconds timestamp from an older SDK, 100 days old.
+	events.append({"event": "old_seconds", "timestamp": (now_ms - 100 * 86400 * 1000) / 1000, "data": {}})
+	for i in 600:
+		events.append({"event": "e%d" % i, "timestamp": now_ms - 1000 + i, "data": {}})
+	_write(name, JSON.stringify({"version": 2, "groups": [{"origin": ORIGIN_A, "events": events}]}))
+	var sdk := start()
+	eq(sdk.pending_events.size(), 500, "capped at 500 across groups")
+	eq(sdk.pending_events[0]["event"], "game_started", "this run's game_started is kept")
+	eq(sdk.pending_events[1]["event"], "e101", "the oldest went first")
+	eq(sdk.get_delivery_stats()["dropped_too_old"], 4, "older than 89 days dropped and counted")
+	eq(sdk.get_delivery_stats()["dropped_overflow"], 101, "past the cap dropped and counted")
+	var doc = _queue_doc(sdk)
+	var total := 0
+	for g in doc["groups"]:
+		total += g["events"].size()
+	eq(total, 500, "the trimmed queue is saved")
+
+func test_queue_forgotten_on_optout_and_reset_kept_on_403() -> void:
+	var sdk := started_with_origin(ORIGIN_A)
+	sdk.track_event("a")
+	sdk._persist_queue()
+	check(_queue_doc(sdk) != null, "queued")
+	sdk.set_tracking_enabled(false)
+	eq(_queue_doc(sdk), null, "the player's opt-out deletes the queue")
+	sdk.set_tracking_enabled(true)
+	sdk.track_event("b")
+	sdk._persist_queue()
+	sdk.reset_device_id()
+	eq(_queue_doc(sdk), null, "a reset identity deletes the queue")
+	_clean_storage()
+	var refused := started_with_origin(ORIGIN_A)
+	refused.track_event("c")
+	# Answered before the end of the frame, so the deferred write has not run.
+	refused.answer(403, {"error": "public_key_inactive"})
+	var doc = _queue_doc(refused)
+	check(doc != null and doc["groups"][0]["events"].map(func(e): return e["event"]).has("c"), "a 403 keeps the events for the next launch")
+	eq(refused.get_status_reason(), "invalid_key", "and stops sending this run")
+
+func test_400_with_index_drops_that_event() -> void:
+	var sdk := started_with_session()
+	for i in 3:
+		sdk.track_event("e%d" % i)
+	sdk.flush()
+	sdk.answer(400, {"error": "reserved_key", "index": 1})
+	eq(sdk.event_names(sdk.unanswered()[0]), ["e0", "e2"], "the named event is dropped, the rest resent at once")
+	sdk.answer(202, {})
+	eq(sdk.get_delivery_stats()["dropped_refused"], 1, "counted")
+	check(signal_args("flush_failed").has("reserved_key"), "reported")
+
+func test_400_batch_too_large_halves_other_400_drops() -> void:
+	var sdk := started_with_session()
+	for i in 4:
+		sdk.track_event("e%d" % i)
+	sdk.flush()
+	sdk.answer(400, {"error": "batch_too_large"})
+	eq(sdk.event_names(sdk.unanswered()[0]), ["e0", "e1"], "halved")
+	sdk.answer(202, {})
+	sdk.answer(202, {})
+	eq(sdk.pending_events.size(), 0, "both halves delivered")
+	sdk.track_event("x")
+	sdk.track_event("y")
+	sdk.flush()
+	sdk.answer(400, {"error": "invalid_json"})
+	eq(sdk.pending_events.size(), 0, "another 400 drops the request's events")
+	eq(sdk.get_delivery_stats()["dropped_refused"], 2, "counted")
+
+func test_415_resends_uncompressed_once_then_drops() -> void:
+	var sdk := started_with_session()
+	sdk.track_event("big", {"blob": "y".repeat(2000)})
+	sdk.flush()
+	var first: Dictionary = sdk.unanswered()[0]
+	eq(sdk.header(first, "Content-Encoding"), "gzip", "sent compressed")
+	sdk.answer(415, {"error": "unsupported_encoding"})
+	var second: Dictionary = sdk.unanswered()[0]
+	eq(sdk.header(second, "Content-Encoding"), "", "resent uncompressed once")
+	check(second["body"] is String, "as text")
+	sdk.answer(415, {"error": "unsupported_encoding"})
+	eq(sdk.pending_events.size(), 0, "then dropped")
+	eq(sdk.get_delivery_stats()["dropped_refused"], 1, "and counted")
+	sdk.track_event("next", {"blob": "z".repeat(2000)})
+	sdk.flush()
+	eq(sdk.header(sdk.unanswered()[0], "Content-Encoding"), "gzip", "later batches compress again")
+
+func test_413_splits_the_batch() -> void:
+	var sdk := started_with_session()
+	for i in 4:
+		sdk.track_event("e%d" % i)
+	sdk.flush()
+	sdk.answer(413, {"error": "payload_too_large"})
+	eq(sdk.event_names(sdk.unanswered()[0]).size(), 2, "a 413 halves the batch")
+
+func test_gzip_from_1024_bytes() -> void:
+	var sdk := started_with_session()
+	sdk.track_event("small")
+	sdk.flush()
+	var small: Dictionary = sdk.unanswered()[0]
+	check(small["body"] is String, "a small body is plain")
+	eq(sdk.header(small, "Content-Encoding"), "", "no encoding header")
+	sdk.answer(202, {})
+	for i in 30:
+		sdk.track_event("bulk%d" % i, {"pad": "p".repeat(20)})
+	sdk.flush()
+	var big: Dictionary = sdk.unanswered()[0]
+	check(big["body"] is PackedByteArray, "a body of 1,024 bytes or more is compressed")
+	eq(sdk.header(big, "Content-Encoding"), "gzip", "with Content-Encoding: gzip")
+	eq(big["body"].slice(0, 2).hex_encode(), "1f8b", "as a gzip stream")
+	check(sdk.body_text(big).to_utf8_buffer().size() >= 1024, "the threshold is on the uncompressed size")
+	eq(sdk.events_in(big).size(), 30, "and decodes to the batch")
+
+func test_signing_vectors() -> void:
+	var v: Dictionary = _vectors()["signing"]
+	var sdk := make()
+	for case in v["header"]:
+		eq("v1=" + sdk._sign(v["secret"], int(case["timestamp"]), case["body"]), case["header"], "header vector: %s" % case["name"])
+	for case in v["beacon"]:
+		eq(sdk._sign(v["secret"], int(case["t"]), case["inner"]), case["envelope"]["signed"]["sig"], "beacon vector: %s" % case["name"])
+		eq(case["envelope"]["signed"]["body"], case["inner"], "the beacon signs the inner body text")
+	sdk.free()
+
+func test_signed_batch_uses_server_clock() -> void:
+	var secret := "dGVzdC1zZWNyZXQtZm9yLWRlbGl2ZXJ5LWNvbnRyYWN0"
+	var sdk := started_with_origin(ORIGIN_A, {"signing": {"algorithm": "HMAC-SHA256", "version": 1, "secret": secret, "serverTime": 1800000100}})
+	var req: Dictionary = sdk.unanswered()[0]
+	eq(sdk.header(req, "X-Ravensight-Timestamp"), "1800000100", "device clock corrected by serverTime")
+	eq(sdk.header(req, "X-Ravensight-Signature"), "v1=" + sdk._sign(secret, 1800000100, sdk.body_text(req)), "signed over the exact body")
+	sdk.answer(202, {})
+	sdk.answer(304, "")
+	for i in 30:
+		sdk.track_event("bulk%d" % i, {"pad": "p".repeat(20)})
+	sdk.flush()
+	var big: Dictionary = sdk.unanswered()[0]
+	eq(sdk.header(big, "X-Ravensight-Signature"), "v1=" + sdk._sign(secret, 1800000100, sdk.body_text(big)), "a compressed body is signed over its uncompressed bytes")
+	# A 401 for the signature opens a new session (and secret) once.
+	sdk.answer(401, {"error": "signature_expired"})
+	eq(sdk.unanswered()[0]["path"], "/session", "a new session")
+	sdk.answer(201, {"token": "t2", "expiresIn": 86400, "origin": ORIGIN_B})
+	var resent: Dictionary = sdk.unanswered()[0]
+	eq(resent["path"], "/track/batch", "the batch is resent")
+	eq(sdk.header(resent, "X-Ravensight-Signature"), "", "a session with no signing sends no signature")
+	_clean_storage()
+	var live := started_with_session()
+	live.track_event("x")
+	live.flush()
+	eq(live.header(live.unanswered()[0], "X-Ravensight-Signature"), "", "a live key's session is not signed")
+
+func test_event_size_vectors() -> void:
+	var sdk := make()
+	for case in _vectors()["anyKeyEventSize"]["cases"]:
+		var data: Dictionary = _expand(case["data"])
+		eq(sdk._event_bytes(data) > Fake.MAX_EVENT_BYTES, case["expect"] == "event_too_large", "local size check agrees: %s" % case["name"])
+	sdk.free()
+
+func test_full_queue_evicts_automatic_errors_first() -> void:
+	var sdk := start({"max_queue_size": 4})
+	# The settings check is never answered, so nothing is sent.
+	var crash := {"rs_kind": "error", "rs_severity": "error", "rs_message": "x", "rs_source": "uncaught"}
+	sdk.track_event("a")
+	sdk.track_event("crash", crash)
+	sdk.track_event("b")
+	eq(queued_names(sdk), ["game_started", "a", "b", "crash"], "gameplay goes ahead of a queued automatic error")
+	sdk.track_event("c")
+	eq(queued_names(sdk), ["game_started", "a", "b", "c"], "full: the automatic error is evicted, not the oldest")
+	sdk.track_event("crash2", crash)
+	eq(queued_names(sdk), ["game_started", "a", "b", "c"], "an automatic error never evicts gameplay")
+	sdk.track_event("manual", {"rs_kind": "error", "rs_severity": "error", "rs_message": "y", "rs_source": "manual"})
+	eq(queued_names(sdk), ["game_started", "b", "c", "manual"], "a manual error is gameplay; the oldest goes, game_started kept")
+	eq(sdk.get_delivery_stats()["dropped_overflow"], 3, "counted")
+
+func test_json_escapes_control_characters() -> void:
+	var sdk := started_with_session()
+	sdk.track_event("ctl", {"note": "a\u0001b"})
+	sdk.flush()
+	var text := sdk.body_text(sdk.unanswered()[0])
+	check(text.contains("a\\u0001b"), "a control character is escaped in the body")
+	eq(sdk.events_in(sdk.unanswered()[0])[0]["data"]["note"], "a\u0001b", "and decodes to the same text")
+
+func test_device_fields_on_session() -> void:
+	var sdk := start()
+	sdk.answer(200, {"trackingEnabled": true})
+	var body = JSON.parse_string(sdk.requests[1]["body"])
+	eq(body["device"], {"model": "Test Model", "osVersion": "14.2", "gpu": "Test GPU"}, "model, OS version and GPU")
+	_clean_storage()
+	var other := make()
+	other.device_raw = {"model": "  Pixel\u0007 7  ", "osVersion": "", "gpu": "G".repeat(200)}
+	root.add_child(other)
+	other.answer(200, {"trackingEnabled": true})
+	var b2 = JSON.parse_string(other.requests[1]["body"])
+	eq(b2["device"], {"model": "Pixel 7", "gpu": "G".repeat(128)}, "trimmed, printable, at most 128, empty left out")
+	_clean_storage()
+	var none := make()
+	none.device_raw = {}
+	root.add_child(none)
+	none.answer(200, {"trackingEnabled": true})
+	check(not JSON.parse_string(none.requests[1]["body"]).has("device"), "nothing known: no device object")
+
+func test_background_marker_replays_through_queue_with_origin() -> void:
+	var one := started_with_origin(ORIGIN_A, {}, {"mobile": true})
+	one.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	one.answer_all_ok()
+	var marker = JSON.parse_string(_read("ravensight_bg.save"))
+	eq(marker["origin"], ORIGIN_A, "the marker keeps the session's origin")
+	root.remove_child(one)
+	one.free()
+	var two := started_with_origin(ORIGIN_B, {}, {"mobile": true})
+	var batch: Array = two.events_in(two.unanswered()[0])
+	var exits := batch.filter(func(e): return e["event"] == "game_exited")
+	eq(exits.size(), 1, "the killed run's game_exited is queued")
+	eq(exits[0].get("origin"), ORIGIN_A, "under the killed run's origin")
+
+# --- ads and attribution ------------------------------------------------------------
+
+func test_ad_revenue_conformance() -> void:
+	var sdk := started_with_session()
+	check(sdk.track_ad_revenue("admob", "rewarded", "level_end", "1500", "USD"), "queued")
+	var e: Dictionary = sdk.pending_events.back()
+	eq(e["event"], "rs_ad", "the recommended name")
+	var data: Dictionary = e["data"].duplicate()
+	data.erase("rs_event_id")
+	eq(data, {"rs_kind": "ad", "rs_ad_network": "admob", "rs_ad_format": "rewarded", "rs_ad_placement": "level_end", "rs_ad_result": "shown", "rs_revenue_micros": "1500", "rs_currency": "USD"}, "exactly the seven keys, micros as a digit string")
+	check(sdk.track_ad("applovin", "interstitial", "clicked"), "a click without revenue")
+	eq(sdk.pending_events.back()["data"].has("rs_revenue_micros"), false, "no revenue on a click")
+	check(sdk.track_ad("unity", "banner", "shown", {"revenue_micros": 2500, "currency": "eur"}), "an int of micros")
+	eq(sdk.pending_events.back()["data"]["rs_revenue_micros"], "2500", "is sent as a digit string")
+	eq(sdk.pending_events.back()["data"]["rs_currency"], "EUR", "currency upper case")
+	var before := sdk.pending_events.size()
+	eq(sdk.track_ad("admob", "rewarded", "shown", {"revenue_micros": "1500"}), false, "revenue without a currency is refused locally")
+	eq(sdk.track_ad("admob", "rewarded", "shown", {"revenue_micros": 0.0015, "currency": "USD"}), false, "a float is refused")
+	eq(sdk.track_ad("admob", "rewarded", "shown", {"revenue_micros": "0.0015", "currency": "USD"}), false, "decimal text is refused")
+	eq(sdk.track_ad("admob", "rewarded", "clicked", {"revenue_micros": "10", "currency": "USD"}), false, "revenue on a click is refused")
+	eq(sdk.track_ad("admob", "video", "shown"), false, "an unknown format is refused")
+	eq(sdk.track_ad("", "banner", "shown"), false, "an empty network is refused")
+	eq(sdk.track_ad("admob", "banner", "shown", {"placement": "p".repeat(101)}), false, "a long placement is refused")
+	eq(sdk.pending_events.size(), before, "nothing refused was queued")
+	sdk.track_ad("admob", "banner", "failed", {"placement": ""})
+	eq(sdk.pending_events.back()["data"].has("rs_ad_placement"), false, "an empty placement is left out")
+
+func test_micros_without_float_multiply() -> void:
+	eq(Fake.micros_from_decimal_string("0.0015"), "1500", "0.0015 is 1500")
+	eq(Fake.micros_from_decimal_string("1.23456789"), "1234568", "half up at the seventh decimal")
+	eq(Fake.micros_from_decimal_string("1.2345675"), "1234568", "a 5 rounds up")
+	eq(Fake.micros_from_decimal_string("1.2345674"), "1234567", "a 4 rounds down")
+	eq(Fake.micros_from_decimal_string("1.9999995"), "2000000", "the carry runs through")
+	eq(Fake.micros_from_decimal_string("9.9999999"), "10000000", "and adds a digit")
+	eq(Fake.micros_from_decimal_string("0.0000005"), "1", "half a micro rounds up")
+	eq(Fake.micros_from_decimal_string("12"), "12000000", "a whole number")
+	eq(Fake.micros_from_decimal_string(".5"), "500000", "no leading digit")
+	eq(Fake.micros_from_decimal_string("0"), "0", "zero")
+	for bad in ["", "abc", "-1", "1e5", "1.2.3", " ", "999999999999.9999999"]:
+		eq(Fake.micros_from_decimal_string(bad), "", "refused: '%s'" % bad)
+	eq(Fake.micros_from_revenue(0.0015), "1500", "a mediation double of 0.0015")
+	eq(Fake.micros_from_revenue(1.23456789), "1234568", "a mediation double of 1.23456789")
+	eq(Fake.micros_from_revenue(-1.0), "", "negative refused")
+	eq(Fake.micros_from_revenue(INF), "", "infinity refused")
+
+func test_attribution_once_per_install() -> void:
+	var sdk := started_with_session()
+	check(sdk.set_attribution({"source": "store_referrer", "network": "newsletter", "campaign": "spring", "adset": "", "touch_time": 1767225600000}), "sent")
+	var data: Dictionary = sdk.pending_events.back()["data"].duplicate()
+	data.erase("rs_event_id")
+	eq(sdk.pending_events.back()["event"], "rs_attribution", "the recommended name")
+	eq(data, {"rs_kind": "attribution", "rs_attr_source": "store_referrer", "rs_attr_network": "newsletter", "rs_campaign": "spring", "rs_touch_time": 1767225600000}, "empty fields left out")
+	eq(sdk.set_attribution({"source": "organic"}), false, "a second call in the run sends nothing")
+	root.remove_child(sdk)
+	sdk.free()
+	var relaunch := started_with_session()
+	eq(relaunch.set_attribution({"source": "organic"}), false, "nor after a restart")
+	eq(relaunch.get_device_id(), relaunch.device_id, "get_device_id() for partner SDKs")
+	relaunch.reset_device_id()
+	check(relaunch.set_attribution({"source": "organic"}), "a reset identity is a new install")
+	eq(relaunch.set_attribution({"source": ""}), false, "a source is required")
+
+# --- exposure contract -----------------------------------------------------------
+
+func _with_config(props: Dictionary = {}) -> Fake:
+	var sdk := started_with_session(props)
+	sdk.fetch_config()
+	sdk.answer(200, _config_doc())
+	return sdk
+
+func test_exposure_fetch_alone_tags_nothing() -> void:
+	var sdk := _with_config()
+	sdk.track_event("before_read")
+	eq(sdk.pending_events.back()["data"].has("rs_exp_difficulty"), false, "a fetch with no typed read sends no tag")
+	eq(queued_names(sdk).has("rs_exposure"), false, "and no rs_exposure")
+
+func test_exposure_first_read_tags_later_events() -> void:
+	var sdk := _with_config()
+	sdk.track_event("before_read")
+	sdk.get_config("speed", 0)
+	sdk.get_config("hints", true)
+	sdk.track_event("after_read")
+	eq(queued_names(sdk), ["before_read", "rs_exposure", "after_read"], "one rs_exposure at the first read")
+	eq(sdk.pending_events[0]["data"].has("rs_exp_difficulty"), false, "earlier events stay untagged")
+	eq(sdk.pending_events[1]["data"]["rs_exp_difficulty"], "easy", "rs_exposure carries the tags")
+	eq(sdk.pending_events[2]["data"]["rs_exp_difficulty"], "easy", "later events carry the tag")
+
+func test_exposure_new_session_starts_untagged() -> void:
+	var sdk := _with_config({"mobile": true, "session_timeout": 60.0})
+	sdk.get_config("speed", 0)
+	sdk.notification(Node.NOTIFICATION_APPLICATION_PAUSED)
+	sdk.answer_all_ok()
+	sdk.advance(100.0)
+	sdk.notification(Node.NOTIFICATION_APPLICATION_RESUMED)
+	sdk.answer_all_ok()
+	sdk.answer(200, _config_doc())
+	sdk.track_event("new_session")
+	eq(sdk.pending_events.back()["data"].has("rs_exp_difficulty"), false, "a second session starts untagged")
+	sdk.get_config("speed", 0)
+	sdk.track_event("after")
+	eq(sdk.pending_events.back()["data"].get("rs_exp_difficulty"), "easy", "until its own first read")
+
+func test_exposure_stopped_experiment_untagged() -> void:
+	var sdk := _with_config()
+	sdk.get_config("speed", 0)
+	var stopped := _config_doc()
+	stopped["experiments"] = []
+	stopped["etag"] = '"' + "b".repeat(64) + '"'
+	sdk.fetch_config()
+	sdk.answer(200, stopped)
+	sdk.track_event("after_stop")
+	eq(sdk.pending_events.back()["data"].has("rs_exp_difficulty"), false, "a stopped experiment is not tagged after the next fetch")
+
+func test_exposure_offline_event_keeps_tag() -> void:
+	var one := _with_config()
+	one.get_config("speed", 0)
+	one.track_event("offline_play")
+	one._persist_queue()
+	root.remove_child(one)
+	one.free()
+	var two := started_with_origin(ORIGIN_B)
+	var batch: Array = two.events_in(two.unanswered()[0])
+	var played := batch.filter(func(e): return e["event"] == "offline_play")
+	eq(played.size(), 1, "the queued event is sent on the next launch")
+	eq(played[0]["data"].get("rs_exp_difficulty"), "easy", "with the tag it was queued with")
+
+# --- error queue rules (all SDKs, 2026-11-06) -----------------------------------
+
+const CAPTURE := {"rs_kind": "error", "rs_severity": "error", "rs_message": "boom", "rs_source": "uncaught"}
+
+func test_error_rule_1_gameplay_before_captures() -> void:
+	var sdk := start()
+	sdk.track_event("a")
+	sdk.track_event("capture", CAPTURE)
+	sdk.track_event("b")
+	sdk.track_event("own_error", {"rs_kind": "error", "rs_severity": "error", "rs_message": "game", "rs_source": "manual"})
+	eq(queued_names(sdk), ["game_started", "a", "b", "own_error", "capture"], "gameplay, the game's own errors included, before captures")
+	sdk.answer(200, {"trackingEnabled": true})
+	sdk.answer(201, {"token": "t", "expiresIn": 86400})
+	eq(sdk.event_names(sdk.unanswered()[0]), ["game_started", "a", "b", "own_error", "capture"], "and so within the flush")
+	# A queue read from disk is ordered the same way.
+	_clean_storage()
+	var name := "ravensight/queue-%s.json" % Fake.fnv1a64_hex("gt_live_test")
+	_write(name, JSON.stringify({"version": 2, "groups": [{"events": [
+		{"event": "old_capture", "timestamp": 1800000000000, "data": CAPTURE},
+		{"event": "old_play", "timestamp": 1800000000001, "data": {}}]}]}))
+	var two := start()
+	eq(queued_names(two), ["game_started", "old_play", "old_capture"], "gameplay before captures after a load")
+
+func test_error_rule_2_full_queue() -> void:
+	var sdk := start({"max_queue_size": 4})
+	sdk.track_event("a")
+	sdk.track_event("c1", CAPTURE)
+	sdk.track_event("c2", CAPTURE)
+	eq(queued_names(sdk), ["game_started", "a", "c1", "c2"], "full")
+	sdk.track_event("c3", CAPTURE)
+	eq(queued_names(sdk), ["game_started", "a", "c2", "c3"], "an incoming capture evicts the oldest capture")
+	sdk.track_event("b")
+	sdk.track_event("c")
+	eq(queued_names(sdk), ["game_started", "a", "b", "c"], "gameplay behaves as before: captures go first")
+	sdk.track_event("c4", CAPTURE)
+	eq(queued_names(sdk), ["game_started", "a", "b", "c"], "with no capture queued, an incoming capture is dropped, never a gameplay event")
+
+func test_error_rule_3_trail_never_on_disk_and_optout_deletes() -> void:
+	var sdk := started_with_session()
+	var with_trail := CAPTURE.duplicate()
+	with_trail["rs_trail"] = "+0 info player entered cave"
+	sdk.track_event("capture", with_trail)
+	sdk._persist_queue()
+	var text := _read(_queue_file(sdk))
+	check(text.contains("capture"), "the capture is persisted")
+	check(not text.contains("rs_trail") and not text.contains("entered cave"), "its trail is not")
+	eq(sdk.pending_events.back()["data"].get("rs_trail"), "+0 info player entered cave", "the trail stays in memory for this run")
+	sdk.set_tracking_enabled(false)
+	eq(_read(_queue_file(sdk)), "", "opt-out deletes persisted captures")
+	sdk.set_tracking_enabled(true)
+	sdk.track_event("capture", CAPTURE)
+	sdk._persist_queue()
+	check(_read(_queue_file(sdk)).contains("capture"), "persisted again")
+	sdk.reset_device_id()
+	eq(_read(_queue_file(sdk)), "", "a device id reset deletes persisted captures")
+
+func test_error_rule_inflight_never_evicted() -> void:
+	var sdk := started_with_session({"max_queue_size": 4})
+	sdk.track_event("c1", CAPTURE)
+	sdk.track_event("a")
+	sdk.flush()
+	var batch: Dictionary = sdk.unanswered()[0]
+	eq(sdk.event_names(batch), ["a", "c1"], "a batch with a capture in flight")
+	sdk.track_event("b")
+	sdk.track_event("c2", CAPTURE)
+	sdk.track_event("c3", CAPTURE)
+	eq(queued_names(sdk), ["a", "c1", "b", "c3"], "the capture outside the flight went, not the one in it")
+	sdk.track_event("c4", CAPTURE)
+	eq(queued_names(sdk), ["a", "c1", "b", "c4"], "again the capture outside the flight")
+	sdk.track_event("c")
+	eq(queued_names(sdk), ["a", "c1", "b", "c"], "gameplay evicts the capture outside the flight, not the one in it")
+	sdk.answer(202, {})
+	eq(queued_names(sdk), ["b", "c"], "the answer removes exactly the batch it sent")
+	# Everything queued is in flight: the incoming event is dropped.
+	var full := started_with_session({"max_queue_size": 2})
+	full.track_event("x", CAPTURE)
+	full.track_event("y")
+	full.flush()
+	full.track_event("z")
+	full.track_event("w", CAPTURE)
+	eq(queued_names(full), ["y", "x"], "nothing in flight is evicted, the incoming events are dropped")
+
+func test_queue_temp_file_never_left_behind() -> void:
+	var sdk := started_with_session()
+	var name := _queue_file(sdk)
+	sdk.track_event("a")
+	sdk._persist_queue()
+	# A write that died between the temporary file and the rename.
+	_write(name + ".tmp", "{\"partial")
+	sdk.set_tracking_enabled(false)
+	eq(_read(name), "", "opt-out deletes the queue file")
+	eq(_read(name + ".tmp"), "", "and the leftover temporary file")
+	sdk.set_tracking_enabled(true)
+	sdk.track_event("b")
+	sdk._persist_queue()
+	_write(name + ".tmp", "{\"partial")
+	sdk.reset_device_id()
+	eq(_read(name + ".tmp"), "", "a device id reset deletes it too")
+	sdk.track_event("c")
+	sdk._persist_queue()
+	_write(name + ".tmp", "{\"partial")
+	sdk.flush()
+	sdk.answer_all_ok()
+	eq(_read(name), "", "an emptied queue deletes the file")
+	eq(_read(name + ".tmp"), "", "and the leftover temporary file")
+	# A rename that fails (a folder sits where the file goes) deletes its
+	# temporary file.
+	DirAccess.make_dir_recursive_absolute(_file(name))
+	sdk.track_event("d")
+	sdk._persist_queue()
+	check(not FileAccess.file_exists(_file(name + ".tmp")), "a failed rename leaves no temporary file")
+	DirAccess.remove_absolute(_file(name))

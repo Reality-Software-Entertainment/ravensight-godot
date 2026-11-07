@@ -7,10 +7,13 @@ const TEST_STORAGE_DIR := "user://ravensight_tests/"
 
 var fake_now: float = 1000.0
 var fake_unix: int = 1800000000
+## Added to fake_unix for the millisecond clock.
+var fake_ms: int = 0
 var mobile: bool = false
-## What _random() returns: 0.5 is a jitter factor of exactly 1.0, so the
-## backoff waits are the unspread 10, 20, 40 seconds.
-var fake_random: float = 0.5
+## What _random() returns. The jitter factor is 0.5 + 0.5 * this, so the
+## default is a factor just under 1: backoff waits a hair under 10, 20, 40
+## seconds, retried by the whole second.
+var fake_random: float = 0.999999
 var web: bool = false
 var memory: float = 128.0
 var ticks: int = 2500
@@ -34,8 +37,17 @@ func _now() -> float:
 func _unix_now() -> int:
 	return fake_unix
 
+func _unix_now_ms() -> int:
+	return fake_unix * 1000 + fake_ms
+
 func _storage_dir() -> String:
 	return TEST_STORAGE_DIR
+
+## What the engine reports about the device, fixed for tests.
+var device_raw: Dictionary = {"model": "Test Model", "osVersion": "14.2", "gpu": "Test GPU"}
+
+func _device_raw() -> Dictionary:
+	return device_raw
 
 func _is_mobile() -> bool:
 	return mobile
@@ -136,8 +148,15 @@ func header(req: Dictionary, name: String) -> String:
 			return str(h).substr(name.length() + 2)
 	return ""
 
+## The request body as text, gunzipped when it was sent compressed.
+func body_text(req: Dictionary) -> String:
+	var body = req["body"]
+	if body is PackedByteArray:
+		return body.decompress_dynamic(-1, FileAccess.COMPRESSION_GZIP).get_string_from_utf8()
+	return str(body)
+
 func events_in(req: Dictionary) -> Array:
-	var parsed = JSON.parse_string(req["body"])
+	var parsed = JSON.parse_string(body_text(req))
 	if parsed is Dictionary and parsed.has("events"):
 		return parsed["events"]
 	return []
