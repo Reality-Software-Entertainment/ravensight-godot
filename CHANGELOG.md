@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- A `push_error()` or engine error caught by automatic capture is sent with `rs_severity` `error`, matching its `rs_error_type` `ERROR`. It was sent as `warning`. `push_warning()` and shader messages stay `warning`.
+
 ## [0.5.0] - 2026-11-06
 
 Needs a Ravensight server that accepts origins, signatures, gzip bodies,

@@ -374,7 +374,7 @@ still prints and handles every error exactly as before.
 | What happens | `rs_source` | `rs_severity` | `rs_error_type` |
 | --- | --- | --- | --- |
 | A script error at run time, such as a call on `null` | `uncaught` | `error` | `SCRIPT` |
-| `push_error()`, or an engine error | `log` | `warning` | `ERROR` |
+| `push_error()`, or an engine error | `log` | `error` | `ERROR` |
 | `push_warning()`, or an engine warning | `log` | `warning` | `WARNING` |
 | A shader error | `log` | `warning` | `SHADER` |
 

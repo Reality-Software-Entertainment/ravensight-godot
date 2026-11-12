@@ -2009,7 +2009,7 @@ func _capture_logged_error(entry: Dictionary) -> void:
 		var scrubbed := _scrub(message, MAX_ERROR_MESSAGE_CHARS)
 		var props := {
 			"rs_kind": "error",
-			"rs_severity": "error" if is_script else "warning",
+			"rs_severity": level,
 			"rs_source": "uncaught" if is_script else "log",
 			"rs_error_type": error_type.substr(0, MAX_ERROR_TYPE_CHARS),
 			"rs_message": scrubbed.substr(0, MAX_ERROR_MESSAGE_CHARS),

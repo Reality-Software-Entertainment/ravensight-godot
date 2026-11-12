@@ -1625,11 +1625,12 @@ func test_push_error_and_warning_captured() -> void:
 	if errors.size() != 2:
 		return
 	eq(errors[0]["rs_source"], "log", "push_error is a log capture")
-	eq(errors[0]["rs_severity"], "warning", "log captures are warnings")
+	eq(errors[0]["rs_severity"], "error", "push_error is an error, matching its type")
 	eq(errors[0]["rs_error_type"], "ERROR", "error type from the Logger enum")
 	eq(errors[0]["rs_message"], "door 42 failed to open", "message")
 	check(str(errors[0].get("rs_stack", "")).begins_with("at test_push_error_and_warning_captured (res://tests/run.gd:"), "stack from the script backtrace: " + str(errors[0].get("rs_stack", "")))
 	eq(errors[1]["rs_error_type"], "WARNING", "push_warning")
+	eq(errors[1]["rs_severity"], "warning", "push_warning stays a warning")
 	check(not errors[0].has("rs_trail"), "no trail while the switch is off")
 	eq(sdk.pending_events[sdk.pending_events.size() - 1]["event"], "error", "default event name")
 
