@@ -176,6 +176,10 @@ func _run() -> void:
 		"test_identify_optout_deletes",
 		"test_identify_late_200_after_reset",
 		"test_identify_malformed_stored_ignored",
+		"test_identify_review_f2_new_salt_rehashes",
+		"test_identify_review_f3_enable_in_open_session",
+		"test_identify_review_f4_on_disk_before_yes",
+		"test_identify_review_playtest_leaves_storage",
 	]
 	# RAVENSIGHT_TEST=name1,name2 runs only those tests.
 	var only := OS.get_environment("RAVENSIGHT_TEST")
@@ -3114,3 +3118,65 @@ func test_identify_malformed_stored_ignored() -> void:
 		eq(_id_count(sdk), 0, "nothing sent: " + bad)
 		_id_free(sdk)
 	_id_salt = ""
+
+func test_identify_review_f2_new_salt_rehashes() -> void:
+	var d: Dictionary = _identify_vectors()["salts_differ"]
+	_id_salt = d["salt_a"]
+	var first := start()
+	_id_serve(first)
+	first.identify(d["accountId"])
+	_id_serve(first)
+	eq(_id_sends(first)[0]["accountHash"], d["wire_a"], "salt a")
+	_id_free(first)
+	_id_salt = d["salt_b"]
+	var sdk := start()
+	sdk.identify(d["accountId"])
+	_id_serve(sdk)
+	var sends := _id_sends(sdk)
+	eq(sends.size(), 1, "the same account is not lost when the salt changes")
+	if sends.size() == 1:
+		eq(sends[0]["accountHash"], d["wire_b"], "hashed under the new salt")
+	eq(_id_stored(), {"salt": d["salt_b"], "accountHash": d["wire_b"]}, "stored under the new salt")
+
+func test_identify_review_f3_enable_in_open_session() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	var sdk := start()
+	_id_serve(sdk)
+	sdk.set_enabled(false)
+	sdk.identify("u1")
+	_id_serve(sdk)
+	eq(_id_count(sdk), 0, "nothing while switched off")
+	sdk.set_enabled(true)
+	_id_serve(sdk)
+	eq(_id_count(sdk), 1, "switching back on sends it on the open session")
+
+func test_identify_review_f4_on_disk_before_yes() -> void:
+	var saved := JSON.stringify(_identify_vectors()["sequence"][1]["expect"]["stored"])
+	var old_id := "0123456789abcdef0123456789abcdef-macos"
+	_write(IDENTITY_FILE, saved)
+	var declined := start({"consent": "opt_in"})
+	declined.set_tracking_enabled(false)
+	eq(_id_stored(), null, "a decline deletes an identity on disk")
+	_id_free(declined)
+	_clean_storage()
+	_write(IDENTITY_FILE, saved)
+	_write("device_id.save", old_id)
+	var sdk := start({"consent": "opt_in"})
+	sdk.reset_identity()
+	eq(_id_stored(), null, "a sign-out before the yes deletes it")
+	sdk.set_tracking_enabled(true)
+	check(sdk.device_id != old_id and not sdk.device_id.is_empty(), "and the device is rotated")
+	_id_salt = _identify_vectors()["salt"]
+	_id_serve(sdk)
+	eq(_id_count(sdk), 0, "the signed-out hash is never sent")
+
+func test_identify_review_playtest_leaves_storage() -> void:
+	var saved := JSON.stringify(_identify_vectors()["sequence"][1]["expect"]["stored"])
+	_write(IDENTITY_FILE, saved)
+	OS.set_environment("RAVENSIGHT_PLAYTEST_TOKEN", "pt_tok")
+	OS.set_environment("RAVENSIGHT_PLAYTEST_RUN_ID", "run42")
+	var sdk := start()
+	sdk.identify("u1")
+	sdk.identify("u2")
+	sdk.reset_identity()
+	eq(_read(IDENTITY_FILE), saved, "a playtest run never touches the player's saved identity")
