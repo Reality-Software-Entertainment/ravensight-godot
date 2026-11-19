@@ -181,6 +181,16 @@ func _run() -> void:
 		"test_identify_review_f4_on_disk_before_yes",
 		"test_identify_review_playtest_leaves_storage",
 		"test_identify_review_f7_clock_ahead",
+		"test_campaign_link_setter_sent_lowercased_once",
+		"test_campaign_link_invalid_inputs",
+		"test_campaign_link_failed_session_keeps_it",
+		"test_campaign_link_set_while_in_flight_goes_next",
+		"test_campaign_link_stale_201_still_clears",
+		"test_campaign_link_consent_and_gates",
+		"test_campaign_link_playtest_never_attached",
+		"test_campaign_link_from_search_vectors",
+		"test_campaign_link_web_reads_page_once",
+		"test_campaign_link_native_never_reads_page",
 	]
 	# RAVENSIGHT_TEST=name1,name2 runs only those tests.
 	var only := OS.get_environment("RAVENSIGHT_TEST")
@@ -3205,3 +3215,239 @@ func test_identify_review_f7_clock_ahead() -> void:
 			_:
 				sdk.answer(304, "")
 	eq(_id_count(sdk), 1, "identified on the session that just opened")
+
+# --- Campaign links ------------------------------------------------------------------
+
+const LINK_ID := "64b0000000000000000000a1"
+const LINK_ID_2 := "64b0000000000000000000b2"
+
+## The bodies of every POST /session sent so far, parsed, in order.
+func _session_bodies(sdk: Fake) -> Array:
+	return sdk.requests.filter(func(r): return r["path"] == "/session").map(func(r): return JSON.parse_string(sdk.body_text(r)))
+
+## The campaignLink of each session sent so far, "-" for none.
+func _session_links(sdk: Fake) -> Array:
+	return _session_bodies(sdk).map(func(b): return b.get("campaignLink", "-"))
+
+## Opens the next session of a started client: the open one expires, an
+## event is tracked and flushed, and every request is answered.
+func _next_session(sdk: Fake) -> void:
+	sdk.advance(90000.0)
+	sdk.track_event("later")
+	sdk.flush()
+	sdk.answer_all_ok()
+
+## True when no file the SDK saved holds `text`.
+func _nothing_saved_holds(text: String) -> bool:
+	for folder in [Fake.TEST_STORAGE_DIR, Fake.TEST_STORAGE_DIR + "ravensight/"]:
+		var dir := DirAccess.open(folder)
+		if dir == null:
+			continue
+		for f in dir.get_files():
+			if FileAccess.get_file_as_string(folder + f).to_lower().contains(text.to_lower()):
+				return false
+	return true
+
+func test_campaign_link_setter_sent_lowercased_once() -> void:
+	var sdk := make()
+	eq(sdk.set_campaign_link(LINK_ID.to_upper()), true, "a link id in upper case is accepted")
+	root.add_child(sdk)
+	sdk.answer_all_ok()
+	eq(_session_links(sdk), [LINK_ID], "sent lowercased as campaignLink on the first POST /session")
+	eq(sdk.session_token.is_empty(), false, "the session opened")
+	_next_session(sdk)
+	eq(_session_links(sdk), [LINK_ID, "-"], "the next session of the same client carries none")
+	check(_nothing_saved_holds(LINK_ID), "the link is never written to disk")
+	# Set again after the first session: it goes with the next one, once.
+	eq(sdk.set_campaign_link(LINK_ID_2), true, "a later call is accepted")
+	_next_session(sdk)
+	_next_session(sdk)
+	eq(_session_links(sdk), [LINK_ID, "-", LINK_ID_2, "-"], "a later call goes with the next session only")
+	# A second client in the same process carries none unless set again.
+	var other := started_with_session()
+	eq(_session_links(other), ["-"], "a new client starts with no link")
+
+func test_campaign_link_invalid_inputs() -> void:
+	var bad: Array = ["", "abc", LINK_ID.left(23), LINK_ID + "0", "g".repeat(24), " " + LINK_ID, LINK_ID + " ", LINK_ID + "\n", "\n" + LINK_ID, LINK_ID.left(22) + "-1", null, 12345, 6.4e23, ["x"], {"id": LINK_ID}]
+	for value in bad:
+		_clean_storage()
+		var sdk := make()
+		eq(sdk.set_campaign_link(value), false, "refused: %s" % str(value).c_escape())
+		root.add_child(sdk)
+		sdk.answer_all_ok()
+		eq(_session_links(sdk), ["-"], "nothing sent for %s" % str(value).c_escape())
+	var sdk := make()
+	eq(sdk.set_campaign_link(StringName(LINK_ID)), true, "a StringName link id is accepted")
+	eq(sdk.set_campaign_link("zz"), false, "an invalid call is refused")
+	eq(sdk.set_campaign_link(null), false, "null is refused")
+	root.add_child(sdk)
+	sdk.answer_all_ok()
+	eq(_session_links(sdk), [LINK_ID], "an invalid call keeps the earlier valid link")
+
+func test_campaign_link_failed_session_keeps_it() -> void:
+	var sdk := make()
+	sdk.set_campaign_link(LINK_ID)
+	root.add_child(sdk)
+	sdk.answer(200, {"trackingEnabled": true})
+	sdk.answer(500, {"error": "internal_error"})
+	sdk.advance(10.0)
+	sdk.answer(0, "")
+	sdk.advance(20.0)
+	sdk.answer(429, {"error": "rate_limited"}, ["Retry-After: 5"])
+	sdk.advance(5.0)
+	sdk.answer(201, {"expiresIn": 86400})
+	eq(_session_links(sdk), [LINK_ID, LINK_ID, LINK_ID, LINK_ID], "a 500, offline, 429 and a 201 without a token keep it")
+	sdk.flush()
+	sdk.answer_all_ok()
+	eq(_session_links(sdk), [LINK_ID, LINK_ID, LINK_ID, LINK_ID, LINK_ID], "the next attempt carries it")
+	check(not sdk.session_token.is_empty(), "and opens the session")
+	_next_session(sdk)
+	eq(_session_links(sdk).back(), "-", "cleared once a session answered 201 with a token")
+
+func test_campaign_link_set_while_in_flight_goes_next() -> void:
+	var sdk := make()
+	sdk.set_campaign_link(LINK_ID)
+	root.add_child(sdk)
+	sdk.answer(200, {"trackingEnabled": true})
+	eq(_session_links(sdk), [LINK_ID], "the first session carries the first link")
+	sdk.set_campaign_link(LINK_ID_2)
+	sdk.answer_all_ok()
+	_next_session(sdk)
+	_next_session(sdk)
+	eq(_session_links(sdk), [LINK_ID, LINK_ID_2, "-"], "a link set while a session was opening goes with the next one")
+
+func test_campaign_link_stale_201_still_clears() -> void:
+	# The session opened with the link on the server even when the SDK has
+	# moved on (a reset dropped it while in flight): it is not sent twice.
+	var sdk := make()
+	sdk.set_campaign_link(LINK_ID)
+	root.add_child(sdk)
+	sdk.answer(200, {"trackingEnabled": true})
+	sdk.reset_device_id()
+	sdk.answer(201, {"token": "old", "expiresIn": 86400})
+	eq(sdk.session_token, "", "the stale answer is ignored")
+	sdk.track_event("x")
+	sdk.flush()
+	sdk.answer_all_ok()
+	eq(_session_links(sdk), [LINK_ID, "-"], "the next session carries none")
+
+func test_campaign_link_consent_and_gates() -> void:
+	# opt_in: nothing before the yes; the link goes with the first session after it.
+	var sdk := make({"consent": "opt_in"})
+	eq(sdk.set_campaign_link(LINK_ID), true, "accepted before the yes")
+	root.add_child(sdk)
+	sdk.flush()
+	sdk.advance(3600.0)
+	eq(sdk.requests.size(), 0, "no request before the yes")
+	sdk.set_tracking_enabled(true)
+	sdk.answer_all_ok()
+	eq(_session_links(sdk), [LINK_ID], "goes with the first session after the yes")
+	# Opted out: nothing is sent.
+	_clean_storage()
+	_write("ravensight_optout.save", "1")
+	var out := make()
+	out.set_campaign_link(LINK_ID)
+	root.add_child(out)
+	out.flush()
+	out.advance(3600.0)
+	eq(out.requests.size(), 0, "an opted out player sends nothing")
+	# The game's own switch off: nothing is sent.
+	_clean_storage()
+	var off := make({"enabled": false})
+	off.set_campaign_link(LINK_ID)
+	root.add_child(off)
+	off.flush()
+	off.advance(3600.0)
+	eq(off.requests.size(), 0, "enabled = false sends nothing")
+	# No key: inert, and a web build does not even read the page.
+	_clean_storage()
+	var keyless := make({"ingest_key": "", "web": true, "fake_search": "?rs_link=" + LINK_ID})
+	keyless.set_campaign_link(LINK_ID)
+	root.add_child(keyless)
+	keyless.flush()
+	keyless.advance(3600.0)
+	eq(keyless.requests.size(), 0, "no key sends nothing")
+	eq(keyless.page_search_reads, 0, "and reads no page address")
+
+func test_campaign_link_playtest_never_attached() -> void:
+	OS.set_environment("RAVENSIGHT_PLAYTEST_TOKEN", "pt_tok")
+	OS.set_environment("RAVENSIGHT_PLAYTEST_RUN_ID", "run42")
+	var sdk := make()
+	eq(sdk.set_campaign_link(LINK_ID), true, "accepted")
+	root.add_child(sdk)
+	sdk.answer_all_ok()
+	eq(_session_links(sdk), ["-"], "a playtest session never carries the link")
+	eq(sdk._campaign_link, LINK_ID, "and does not clear it")
+
+func test_campaign_link_from_search_vectors() -> void:
+	var sdk := make()
+	var vectors := {
+		"?lang=en&rs_link=%s&utm_source=x" % LINK_ID.to_upper(): LINK_ID,
+		"?rs_link=abc": "",
+		"?rs_link=" + "g".repeat(24): "",
+		"?ref=x": "",
+		"": "",
+		"?": "",
+		"?rs_link=%s&rs_link=%s" % [LINK_ID, LINK_ID_2]: LINK_ID,
+		"?rs_link=abc&rs_link=%s" % LINK_ID: "",
+		"?a=1&rs_link=%s#frag" % LINK_ID: LINK_ID,
+		"?a=1#rs_link=%s" % LINK_ID: "",
+		"?rs_link=%36%34b0000000000000000000a1": LINK_ID,
+		"?rs_link=%36%34B0000000000000000000A1": LINK_ID,
+		"?rs%5Flink=" + LINK_ID: LINK_ID,
+		"rs_link=" + LINK_ID: LINK_ID,
+		"??rs_link=" + LINK_ID: "",
+		"?RS_LINK=" + LINK_ID: "",
+		"?rs_link": "",
+		"?rs_link=": "",
+		"?rs_link=+" + LINK_ID: "",
+		"?rs_link=%20" + LINK_ID: "",
+		"?rs_link=" + LINK_ID + "%0A": "",
+		"?rs_link=" + LINK_ID + "=": "",
+		"?&&rs_link=" + LINK_ID + "&&": LINK_ID,
+		"?x=%zz&rs_link=" + LINK_ID: LINK_ID,
+	}
+	for search in vectors:
+		eq(sdk._campaign_link_from_search(search), vectors[search], "rs_link from %s" % search)
+	# The form decoding is the browser's: "+" is a space, %XX in either case,
+	# a broken escape stays as it is.
+	eq(sdk._form_decode("a+b%4a%4A%4"), "a bJJ%4", "form decoding")
+	eq(sdk._form_decode("%E2%9C%93%zz%"), "✓%zz%", "UTF-8 escapes and broken escapes")
+
+func test_campaign_link_web_reads_page_once() -> void:
+	var sdk := make({"web": true, "fake_search": "?lang=en&rs_link=%s&utm_source=x" % LINK_ID.to_upper()})
+	root.add_child(sdk)
+	sdk.answer_all_ok()
+	eq(_session_links(sdk), [LINK_ID], "a web build sends rs_link from the page address")
+	eq(sdk.page_search_reads, 1, "read once, at start")
+	_next_session(sdk)
+	eq(_session_links(sdk), [LINK_ID, "-"], "and only with the first session")
+	eq(sdk.page_search_reads, 1, "never read again")
+	check(_nothing_saved_holds(LINK_ID), "never written to disk")
+	# A call before start wins over the address; one after start replaces it.
+	_clean_storage()
+	var early := make({"web": true, "fake_search": "?rs_link=" + LINK_ID})
+	early.set_campaign_link(LINK_ID_2)
+	root.add_child(early)
+	early.answer_all_ok()
+	eq(_session_links(early), [LINK_ID_2], "a call before start wins")
+	_clean_storage()
+	var late := make({"web": true, "fake_search": "?rs_link=" + LINK_ID})
+	root.add_child(late)
+	late.set_campaign_link(LINK_ID_2)
+	late.answer_all_ok()
+	eq(_session_links(late), [LINK_ID_2], "a call after start replaces the address's link")
+	# No rs_link, or one that is not a link id: nothing.
+	for search in ["?ref=x", "?rs_link=abc", "?rs_link=" + "g".repeat(24), ""]:
+		_clean_storage()
+		var none := make({"web": true, "fake_search": search})
+		root.add_child(none)
+		none.answer_all_ok()
+		eq(_session_links(none), ["-"], "no campaignLink for %s" % search)
+
+func test_campaign_link_native_never_reads_page() -> void:
+	var sdk := make({"fake_search": "?rs_link=" + LINK_ID})
+	root.add_child(sdk)
+	sdk.answer_all_ok()
+	eq(_session_links(sdk), ["-"], "a native build never reads a page address")
+	eq(sdk.page_search_reads, 0, "and never asks for one")
