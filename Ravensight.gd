@@ -262,6 +262,8 @@ const DEVICE_ID_PATH: String = "user://device_id.save"
 ## the account id.
 const IDENTITY_PATH: String = "user://ravensight_identity.save"
 const IDENTIFY_MAX_BYTES: int = 256
+## A campaign link id: 24 hex characters, sent lowercased.
+const CAMPAIGN_LINK_LENGTH: int = 24
 ## Present only while the player has opted out (see set_tracking_enabled).
 const OPTOUT_PATH: String = "user://ravensight_optout.save"
 ## With consent = "opt_in": present only once the player has said yes.
@@ -303,6 +305,9 @@ var _identify_sent_on: String = ""
 ## A 404 or invalid_account_hash: no more tries this launch.
 var _identify_stopped: bool = false
 var _identify_no_session_retried: bool = false
+## The campaign link waiting for the next session this SDK opens for its own
+## player (24 lowercase hex characters), or "". Memory only, never saved.
+var _campaign_link: String = ""
 var session_expires_at: int = 0
 var _session_request_pending: bool = false
 ## Bumped every time a session is requested or dropped. Bound into each
@@ -536,6 +541,7 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_take_over_quit()
 	_distribution = _validated_distribution()
+	_read_page_campaign_link()
 
 	if playtest_token.is_empty():
 		# The game may have set `consent` after construction: read the
@@ -1336,7 +1342,11 @@ func _start_session(explicit: bool = false) -> void:
 	var device := _device_fields()
 	if not device.is_empty():
 		session_body["device"] = device
-	_send("POST", "/session", headers, _json(session_body), _on_session_response.bind(generation))
+	# The player's own session only, never a playtest run, and once.
+	var campaign_link := _campaign_link if playtest_token.is_empty() else ""
+	if not campaign_link.is_empty():
+		session_body["campaignLink"] = campaign_link
+	_send("POST", "/session", headers, _json(session_body), _on_session_response.bind(generation, campaign_link))
 
 ## The device fields sent on the session: model, OS version and GPU name,
 ## each only when the engine reports it without a permission prompt. No
@@ -1364,7 +1374,14 @@ func _clean_device_field(value: String) -> String:
 	control.compile("[\\x00-\\x1f\\x7f]")
 	return control.sub(value, "", true).strip_edges().left(DEVICE_FIELD_MAX_CHARS).strip_edges()
 
-func _on_session_response(code: int, headers: PackedStringArray, body: PackedByteArray, generation: int) -> void:
+func _on_session_response(code: int, headers: PackedStringArray, body: PackedByteArray, generation: int, campaign_link: String = "") -> void:
+	# The campaign link this request carried opened a session, so it is never
+	# sent again, even when the answer is otherwise ignored below. A link set
+	# while the request was in flight waits for the next session.
+	if code == 201 and not campaign_link.is_empty() and campaign_link == _campaign_link:
+		var opened = _parse_json(body)
+		if opened is Dictionary and opened.has("token"):
+			_campaign_link = ""
 	# A newer session attempt has started (or the session was dropped) since
 	# this request went out. Ignore it rather than let it overwrite state.
 	if generation != _session_request_generation:
@@ -2764,6 +2781,93 @@ func _on_playtest_refused(error: String) -> void:
 
 func _is_fatal_playtest_error(error: String) -> bool:
 	return error == "invalid_playtest_token" or error == "playtest_job_closed"
+
+## --- Public API: campaign links ---------------------------------------------------
+
+## Sends a Ravensight campaign link with the next session this SDK opens, so
+## the player is counted on the Campaign links page. A web build reads
+## `rs_link` from the page address by itself; in a native build, call this
+## from the deep link, universal link, App Link or install referrer handler
+## your game already has, with the `rs_link` value of the incoming address.
+## Best called before the first session opens; a later call goes with the
+## next session the SDK opens.
+##
+## Returns true when `link_id` is a link id (24 hex characters, in any case),
+## which then replaces any link waiting. Returns false for anything else,
+## and nothing changes. The link is held in memory only, sent once, never in
+## a playtest run, and only when a session may open (a key, and with
+## consent = "opt_in" the player's yes).
+func set_campaign_link(link_id: Variant) -> bool:
+	var link := _campaign_link_id(link_id)
+	if link.is_empty():
+		return false
+	_campaign_link = link
+	return true
+
+## `value` lowercased when it is a campaign link id, otherwise "". Never
+## trimmed: surrounding spaces make it invalid.
+func _campaign_link_id(value: Variant) -> String:
+	if typeof(value) != TYPE_STRING and typeof(value) != TYPE_STRING_NAME:
+		return ""
+	var text := String(value)
+	if text.length() != CAMPAIGN_LINK_LENGTH:
+		return ""
+	for i in text.length():
+		if not "0123456789abcdefABCDEF".contains(text[i]):
+			return ""
+	return text.to_lower()
+
+## A web build reads the campaign link the page was reached by, once, at
+## start. A link the game set before this keeps its place. The address is
+## never changed and the link is never saved.
+func _read_page_campaign_link() -> void:
+	if not _is_web() or not _campaign_link.is_empty():
+		return
+	_campaign_link = _campaign_link_from_search(_page_search())
+
+## The page's location.search in a web build, through JavaScriptBridge, or ""
+## when the bridge is missing or answers anything but text. Replaced in tests.
+func _page_search() -> String:
+	if not Engine.has_singleton("JavaScriptBridge"):
+		return ""
+	var search = Engine.get_singleton("JavaScriptBridge").eval("window.location.search", true)
+	return search if search is String else ""
+
+## The first `rs_link` of a query string, read the way a browser's
+## URLSearchParams reads it, when it is a link id; otherwise "". A leading
+## "?" is skipped and anything from "#" on is left out, as location.search
+## leaves out the fragment.
+func _campaign_link_from_search(search: String) -> String:
+	var query := search.get_slice("#", 0)
+	if query.begins_with("?"):
+		query = query.substr(1)
+	for pair in query.split("&", false):
+		var eq_at := pair.find("=")
+		var key := pair if eq_at < 0 else pair.substr(0, eq_at)
+		if _form_decode(key) == "rs_link":
+			return _campaign_link_id(_form_decode("" if eq_at < 0 else pair.substr(eq_at + 1)))
+	return ""
+
+## application/x-www-form-urlencoded decoding as browsers do it: "+" is a
+## space and %XX (either case) a byte, read as UTF-8; a "%" not followed by
+## two hex digits stays as it is. String.uri_decode() differs on lower case
+## escapes, so it is not used.
+func _form_decode(text: String) -> String:
+	var src := text.replace("+", " ").to_utf8_buffer()
+	var out := PackedByteArray()
+	var hex := "0123456789abcdef"
+	var i := 0
+	while i < src.size():
+		if src[i] == 0x25 and i + 2 < src.size():
+			var high := hex.find(char(src[i + 1]).to_lower())
+			var low := hex.find(char(src[i + 2]).to_lower())
+			if high >= 0 and low >= 0:
+				out.append(high * 16 + low)
+				i += 3
+				continue
+		out.append(src[i])
+		i += 1
+	return out.get_string_from_utf8()
 
 ## --- Queue ---------------------------------------------------------------------------
 
