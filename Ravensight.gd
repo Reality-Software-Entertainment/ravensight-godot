@@ -2370,6 +2370,8 @@ func set_enabled(value: bool) -> void:
 	else:
 		_update_reason()
 		_activate()
+		# Back on inside a session that is still open.
+		_send_identify()
 
 ## --- Public API: player privacy -------------------------------------------------
 ##
@@ -2491,9 +2493,10 @@ func identify(account_id: Variant) -> bool:
 		_log_once("identify_unavailable", "Ravensight: identify is not offered by this server, nothing is sent this launch", false)
 		return true
 	if _identify_salt_state == 0 or not _identity_allowed():
-		if _identity.is_empty():
-			_held_account_id = id
-			_has_held_account = true
+		# No salt this launch yet, or not allowed to save: hold the id in
+		# memory only, and hash it under whichever salt the answer brings.
+		_held_account_id = id
+		_has_held_account = true
 		return true
 	if _identity.is_empty():
 		_identity = {"salt": _identify_salt, "accountHash": _identify_hash(_identify_salt, id)}
@@ -2511,7 +2514,10 @@ func identify(account_id: Variant) -> bool:
 ## the previous account. Sends nothing. Does nothing (and keeps the device
 ## id) when no account is stored or held.
 func reset_identity() -> void:
-	if _identity.is_empty() and not _has_held_account:
+	# An identity saved by an earlier launch counts too, even before the
+	# opt-in yes, when it was never loaded.
+	var on_disk := playtest_token.is_empty() and FileAccess.file_exists(_path(IDENTITY_PATH))
+	if _identity.is_empty() and not _has_held_account and not on_disk:
 		return
 	_forget_identity()
 	reset_device_id()
@@ -2575,7 +2581,10 @@ func _forget_identity() -> void:
 	_held_account_id = ""
 	_has_held_account = false
 	_identity = {}
-	_remove_file(IDENTITY_PATH)
+	_identify_no_session_retried = false
+	# Never the player's saved identity in a playtest run.
+	if playtest_token.is_empty():
+		_remove_file(IDENTITY_PATH)
 
 ## The saved identity when it is well formed, otherwise {}. Never writes.
 func _read_saved_identity() -> Dictionary:
@@ -2666,6 +2675,8 @@ func _on_identify_response(code: int, _headers: PackedStringArray, body: PackedB
 		if _identify_no_session_retried:
 			_identify_stopped = true
 		_identify_no_session_retried = true
+	else:
+		_identify_no_session_retried = false
 	# Anything else (409, 429 identify_limited, rate_limited or needs_funds,
 	# 5xx, offline): the identity is kept, this session is not tried again,
 	# and the next session tries once more.
