@@ -557,7 +557,7 @@ them without a permission prompt:
   version only) and `gpu` (`RenderingServer.get_video_adapter_name()`). Each
   is at most 128 printable characters; none is a hardware identifier.
   Country is never sent by the SDK.
-- **Campaign link**, once, on the first session: the `rs_link` value of the
+- **Campaign link**, once, on the next session: the `rs_link` value of the
   page address in a web build, or the id given to `set_campaign_link()`,
   when it is a link id. Nothing else from the address is read.
 
