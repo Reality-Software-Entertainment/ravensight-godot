@@ -180,6 +180,7 @@ func _run() -> void:
 		"test_identify_review_f3_enable_in_open_session",
 		"test_identify_review_f4_on_disk_before_yes",
 		"test_identify_review_playtest_leaves_storage",
+		"test_identify_review_f7_clock_ahead",
 	]
 	# RAVENSIGHT_TEST=name1,name2 runs only those tests.
 	var only := OS.get_environment("RAVENSIGHT_TEST")
@@ -3180,3 +3181,27 @@ func test_identify_review_playtest_leaves_storage() -> void:
 	sdk.identify("u2")
 	sdk.reset_identity()
 	eq(_read(IDENTITY_FILE), saved, "a playtest run never touches the player's saved identity")
+
+func test_identify_review_f7_clock_ahead() -> void:
+	# A device clock days ahead of the server: the answer's absolute expiresAt
+	# is already past by the device clock, but expiry is measured from
+	# expiresIn on the device clock, so the new session is identified.
+	var salt: String = _identify_vectors()["salt"]
+	var sdk := start()
+	sdk.identify("u1")
+	for i in 20:
+		var open := sdk.unanswered()
+		if open.is_empty():
+			break
+		match str(open[0]["path"]).split("?")[0]:
+			"/settings":
+				sdk.answer(200, {"trackingEnabled": true})
+			"/session":
+				sdk.answer(201, {"token": "S1", "expiresIn": 86400, "expiresAt": sdk.fake_unix - 3 * 86400, "identify": {"salt": salt}})
+			"/identify":
+				sdk.answer(200, {"playerId": "px_test"})
+			"/track/batch":
+				sdk.answer(202, {"accepted": true})
+			_:
+				sdk.answer(304, "")
+	eq(_id_count(sdk), 1, "identified on the session that just opened")
