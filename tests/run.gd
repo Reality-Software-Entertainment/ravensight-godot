@@ -159,6 +159,23 @@ func _run() -> void:
 		"test_exposure_new_session_starts_untagged",
 		"test_exposure_stopped_experiment_untagged",
 		"test_exposure_offline_event_keeps_tag",
+		"test_identify_accept_vectors",
+		"test_identify_salts_differ",
+		"test_identify_refuse_vectors",
+		"test_identify_other_values_not_text",
+		"test_identify_sequence",
+		"test_identify_retry_answers",
+		"test_identify_404_and_invalid_hash_stop_the_launch",
+		"test_identify_no_session_once",
+		"test_identify_reset_device_id_keeps_it",
+		"test_identify_different_account_before_salt",
+		"test_identify_request_shape",
+		"test_identify_never_queued",
+		"test_identify_no_key_inert",
+		"test_identify_opt_in_holds_until_yes",
+		"test_identify_optout_deletes",
+		"test_identify_late_200_after_reset",
+		"test_identify_malformed_stored_ignored",
 	]
 	# RAVENSIGHT_TEST=name1,name2 runs only those tests.
 	var only := OS.get_environment("RAVENSIGHT_TEST")
@@ -168,6 +185,8 @@ func _run() -> void:
 		_current = name
 		_clean_storage()
 		_signals.clear()
+		_id_sessions = 0
+		_id_salt = ""
 		await call(name)
 		for child in root.get_children():
 			if child is Fake:
@@ -2597,3 +2616,498 @@ func test_queue_temp_file_never_left_behind() -> void:
 	sdk._persist_queue()
 	check(not FileAccess.file_exists(_file(name + ".tmp")), "a failed rename leaves no temporary file")
 	DirAccess.remove_absolute(_file(name))
+
+# --- identify (docs/identify/CONTRACT.md, vectors version 2) -----------------
+
+const IDENTITY_FILE := "ravensight_identity.save"
+
+var _id_vectors: Dictionary = {}
+var _id_sessions: int = 0
+## The salt every session answer carries, "" for none (an older server).
+var _id_salt: String = ""
+
+func _identify_vectors() -> Dictionary:
+	if _id_vectors.is_empty():
+		_id_vectors = JSON.parse_string(FileAccess.get_file_as_string("res://tests/identify-vectors.json"))
+	return _id_vectors
+
+## Answers every open request: sessions get the tokens S1, S2, ... in order
+## across clients and carry _id_salt; /identify answers come from `answers`
+## ([code, body] pairs), then 200.
+func _id_serve(sdk: Fake, answers: Array = []) -> void:
+	for i in 100:
+		var open := sdk.unanswered()
+		if open.is_empty():
+			return
+		match str(open[0]["path"]).split("?")[0]:
+			"/settings":
+				sdk.answer(200, {"trackingEnabled": true})
+			"/session":
+				_id_sessions += 1
+				var created := {"token": "S%d" % _id_sessions, "expiresIn": 86400}
+				if not _id_salt.is_empty():
+					created["identify"] = {"salt": _id_salt}
+				sdk.answer(201, created)
+			"/identify":
+				if answers.is_empty():
+					sdk.answer(200, {"playerId": "px_test", "linked": true, "verified": false, "repeat": false})
+				else:
+					var a: Array = answers.pop_front()
+					sdk.answer(a[0], a[1])
+			"/track/batch":
+				sdk.answer(202, {"accepted": true})
+			_:
+				sdk.answer(304, "")
+
+func _id_sends(sdk: Fake, from: int = 0) -> Array:
+	var out: Array = []
+	for r in sdk.requests.filter(func(q): return q["path"] == "/identify").slice(from):
+		var parsed = JSON.parse_string(sdk.body_text(r))
+		out.append({"session": sdk.header(r, "X-Session-Token"), "accountHash": parsed.get("accountHash") if parsed is Dictionary else null})
+	return out
+
+func _id_count(sdk: Fake) -> int:
+	return sdk.paths().count("/identify")
+
+func _id_stored() -> Variant:
+	var text := _read(IDENTITY_FILE)
+	if text.is_empty():
+		return null
+	return JSON.parse_string(text)
+
+func _id_free(sdk: Fake) -> void:
+	root.remove_child(sdk)
+	sdk.free()
+
+## A new session for the same client: the old one expires.
+func _id_next_session(sdk: Fake, answers: Array = []) -> void:
+	sdk.advance(90000.0)
+	sdk.track_event("tick")
+	sdk.flush()
+	_id_serve(sdk, answers)
+
+func test_identify_accept_vectors() -> void:
+	var v := _identify_vectors()
+	check(v.get("version") == 2.0, "vectors version 2")
+	_id_salt = v["salt"]
+	for c in v["accept"]:
+		_clean_storage()
+		var sdk := start()
+		_id_serve(sdk)
+		eq(sdk.identify(c["accountId"]), true, "accepted: %s" % c["note"])
+		_id_serve(sdk)
+		var sends := _id_sends(sdk)
+		eq(sends.size(), 1, "one send: %s" % c["note"])
+		if sends.size() == 1:
+			eq(sends[0]["accountHash"], c["wire"], "wire: %s" % c["note"])
+		eq(_id_stored(), {"salt": v["salt"], "accountHash": c["wire"]}, "stored: %s" % c["note"])
+		eq(sdk.is_identified(), true, "is_identified: %s" % c["note"])
+		_id_free(sdk)
+	# A GDScript int is a whole number too.
+	_clean_storage()
+	var n := start()
+	_id_serve(n)
+	n.identify(12345)
+	_id_serve(n)
+	eq(_id_sends(n)[0]["accountHash"], v["accept"][0]["wire"], "the int 12345 hashes as its digits")
+	_id_salt = ""
+
+func test_identify_salts_differ() -> void:
+	var d: Dictionary = _identify_vectors()["salts_differ"]
+	var sdk := make()
+	eq(sdk._identify_hash(d["salt_a"], d["accountId"]), d["wire_a"], "salt a")
+	eq(sdk._identify_hash(d["salt_b"], d["accountId"]), d["wire_b"], "salt b")
+	check(d["wire_a"] != d["wire_b"], "two salts give two wires")
+	sdk.free()
+
+func test_identify_refuse_vectors() -> void:
+	var v := _identify_vectors()
+	_id_salt = v["salt"]
+	for c in v["refuse"]:
+		for before_session in [false, true]:
+			_clean_storage()
+			var sdk := start()
+			if not before_session:
+				_id_serve(sdk)
+			var device := sdk.device_id
+			eq(sdk._identify_refusal(c["accountId"]), c["reason"], "reason: %s" % c["note"])
+			eq(sdk.identify(c["accountId"]), false, "refused: %s" % c["note"])
+			_id_serve(sdk)
+			eq(_id_count(sdk), 0, "nothing sent: %s" % c["note"])
+			eq(_id_stored(), null, "nothing stored: %s" % c["note"])
+			eq(sdk.device_id, device, "device kept: %s" % c["note"])
+			eq(sdk.is_identified(), false, "not identified: %s" % c["note"])
+			_id_free(sdk)
+	# While identified, a refusal keeps everything.
+	_clean_storage()
+	var sdk2 := start()
+	_id_serve(sdk2)
+	sdk2.identify("u1")
+	_id_serve(sdk2)
+	var stored = _id_stored()
+	var device2 := sdk2.device_id
+	for c in v["refuse"]:
+		sdk2.identify(c["accountId"])
+	_id_serve(sdk2)
+	eq(_id_count(sdk2), 1, "no send for a refusal")
+	eq(_id_stored(), stored, "stored identity kept")
+	eq(sdk2.device_id, device2, "device kept")
+	_id_salt = ""
+
+func test_identify_other_values_not_text() -> void:
+	var sdk := make()
+	for value in [[], {}, true, Vector2(1, 2), NAN, INF, 1e300, 0.5, Object.new()]:
+		eq(sdk._identify_refusal(value), "not_text", "not_text: %s" % str(value))
+	eq(sdk._identify_refusal(-7), "", "a negative whole number is accepted")
+	eq(sdk._identify_text(12345.0), "12345", "a whole float is its digits")
+	eq(sdk._identify_text(&"name"), "name", "a StringName is text")
+	sdk.free()
+
+func test_identify_sequence() -> void:
+	var v := _identify_vectors()
+	var seq: Array = v["sequence"]
+	_id_salt = v["salt"]
+	var from := 0
+	var device := ""
+
+	# 0: key and consent; identify("u1") before any session opens.
+	var sdk := start()
+	device = sdk.device_id
+	eq(sdk.identify("u1"), true, seq[0]["step"])
+	eq(_id_sends(sdk), seq[0]["expect"]["sends"], seq[0]["step"])
+	eq(_id_stored(), seq[0]["expect"]["stored"], seq[0]["step"])
+	eq(sdk.is_identified(), seq[0]["expect"]["held_in_memory"], "held in memory")
+	for f in _storage_files():
+		check(_read(f).find("u1") < 0, "the raw id is in no file: " + f)
+
+	# 1: S1 opens with the salt.
+	_id_serve(sdk)
+	eq(_id_sends(sdk), seq[1]["expect"]["sends"], seq[1]["step"])
+	eq(_id_stored(), seq[1]["expect"]["stored"], seq[1]["step"])
+
+	# 2: the same account again in S1.
+	from = _id_count(sdk)
+	device = sdk.device_id
+	sdk.identify("u1")
+	_id_serve(sdk)
+	eq(_id_sends(sdk, from), seq[2]["expect"]["sends"], seq[2]["step"])
+	eq(sdk.device_id != device, seq[2]["expect"]["device_changed"], seq[2]["step"])
+	_id_free(sdk)
+
+	# 3: relaunch, S2 opens with the same salt.
+	sdk = start()
+	eq(sdk.is_identified(), true, "the stored identity is read back")
+	_id_serve(sdk)
+	eq(_id_sends(sdk), seq[3]["expect"]["sends"], seq[3]["step"])
+
+	# 4: an email is refused.
+	from = _id_count(sdk)
+	device = sdk.device_id
+	eq(sdk.identify("player@example.com"), false, seq[4]["step"])
+	eq(sdk._identify_refusal("player@example.com"), seq[4]["expect"]["refused"], seq[4]["step"])
+	_id_serve(sdk)
+	eq(_id_sends(sdk, from), seq[4]["expect"]["sends"], seq[4]["step"])
+	eq(_id_stored(), seq[4]["expect"]["stored"], seq[4]["step"])
+	eq(sdk.device_id != device, seq[4]["expect"]["device_changed"], seq[4]["step"])
+
+	# 5: another account: a fresh device and session S3.
+	from = _id_count(sdk)
+	device = sdk.device_id
+	sdk.identify("u2")
+	_id_serve(sdk)
+	eq(_id_sends(sdk, from), seq[5]["expect"]["sends"], seq[5]["step"])
+	eq(_id_stored(), seq[5]["expect"]["stored"], seq[5]["step"])
+	eq(sdk.device_id != device, seq[5]["expect"]["device_changed"], seq[5]["step"])
+	eq(sdk.session_token, seq[5]["expect"]["new_session"], seq[5]["step"])
+	eq(_read("device_id.save"), sdk.device_id, "the new device id is saved")
+
+	# 6: resetIdentity(): a fresh device, nothing sent; its session is S4.
+	from = _id_count(sdk)
+	device = sdk.device_id
+	sdk.reset_identity()
+	sdk.track_event("after_reset")
+	sdk.flush()
+	_id_serve(sdk)
+	eq(_id_sends(sdk, from), seq[6]["expect"]["sends"], seq[6]["step"])
+	eq(_id_stored(), seq[6]["expect"]["stored"], seq[6]["step"])
+	eq(sdk.device_id != device, seq[6]["expect"]["device_changed"], seq[6]["step"])
+	eq(sdk.session_token, seq[6]["expect"]["new_session"], seq[6]["step"])
+	eq(sdk.is_identified(), false, seq[6]["step"])
+
+	# 7: reset again with nothing stored.
+	from = _id_count(sdk)
+	device = sdk.device_id
+	sdk.reset_identity()
+	_id_serve(sdk)
+	eq(_id_sends(sdk, from), seq[7]["expect"]["sends"], seq[7]["step"])
+	eq(_id_stored(), seq[7]["expect"]["stored"], seq[7]["step"])
+	eq(sdk.device_id != device, seq[7]["expect"]["device_changed"], seq[7]["step"])
+
+	# 8: identify("u3"), answered needs_funds: kept, no loop.
+	from = _id_count(sdk)
+	sdk.identify("u3")
+	_id_serve(sdk, [[429, {"error": "quota_exceeded", "reason": "needs_funds"}]])
+	eq(_id_sends(sdk, from), seq[8]["expect"]["sends"], seq[8]["step"])
+	eq(_id_stored(), seq[8]["expect"]["stored"], seq[8]["step"])
+	sdk.identify("u3")
+	_id_serve(sdk)
+	eq(_id_count(sdk), from + 1, "never in a loop")
+	_id_free(sdk)
+
+	# 9: relaunch; S5 answers a different salt: deleted, never sent.
+	_id_salt = v["salts_differ"]["salt_b"]
+	sdk = start()
+	_id_serve(sdk)
+	eq(sdk.session_token, "S5", "session S5")
+	eq(_id_sends(sdk), seq[9]["expect"]["sends"], seq[9]["step"])
+	eq(_id_stored(), seq[9]["expect"]["stored"], seq[9]["step"])
+	eq(sdk.is_identified(), false, seq[9]["step"])
+	_id_free(sdk)
+
+	# 10: identify("u4"); the session answer has no salt.
+	_id_salt = ""
+	sdk = start()
+	sdk.identify("u4")
+	_id_serve(sdk)
+	eq(_id_sends(sdk), seq[10]["expect"]["sends"], seq[10]["step"])
+	eq(_id_stored(), seq[10]["expect"]["stored"], seq[10]["step"])
+	eq(sdk.is_identified(), false, "the held id is dropped")
+	eq(sdk.identify("u4"), true, "still a valid id")
+	_id_serve(sdk)
+	eq(_id_count(sdk), 0, "unavailable for the rest of the launch")
+
+	# 11: opt out.
+	sdk.set_tracking_enabled(false)
+	_id_serve(sdk)
+	eq(_id_sends(sdk), seq[11]["expect"]["sends"], seq[11]["step"])
+	eq(_id_stored(), seq[11]["expect"]["stored"], seq[11]["step"])
+
+func test_identify_retry_answers() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	var answers := [
+		[429, {"error": "quota_exceeded", "reason": "needs_funds"}],
+		[429, {"error": "identify_limited"}],
+		[429, {"error": "rate_limited"}],
+		[409, {"error": "session_taken"}],
+		[409, {"error": "synthetic_session"}],
+		[503, {}],
+		[500, {"error": "internal"}],
+		[0, ""],
+	]
+	for a in answers:
+		_clean_storage()
+		var sdk := start()
+		_id_serve(sdk)
+		sdk.identify("u1")
+		_id_serve(sdk, [a])
+		sdk.identify("u1")
+		_id_serve(sdk)
+		eq(_id_count(sdk), 1, "no retry in the same session: %s" % str(a))
+		check(_id_stored() != null, "the identity is kept: %s" % str(a))
+		_id_next_session(sdk)
+		eq(_id_count(sdk), 2, "tried again at the next session: %s" % str(a))
+		eq(_id_sends(sdk)[1]["session"], sdk.session_token, "on the new session: %s" % str(a))
+		_id_free(sdk)
+	_id_salt = ""
+
+func test_identify_404_and_invalid_hash_stop_the_launch() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	for a in [[404, {"error": "not_found"}], [400, {"error": "invalid_account_hash"}]]:
+		_clean_storage()
+		var sdk := start()
+		_id_serve(sdk)
+		sdk.identify("u1")
+		_id_serve(sdk, [a])
+		_id_next_session(sdk)
+		sdk.reset_device_id()
+		sdk.track_event("b")
+		sdk.flush()
+		_id_serve(sdk)
+		eq(_id_count(sdk), 1, "not retried this launch: %s" % str(a))
+		check(_id_stored() != null, "kept: %s" % str(a))
+		_id_free(sdk)
+		var next := start()
+		_id_serve(next)
+		eq(_id_count(next), 1, "the next launch tries again: %s" % str(a))
+		_id_free(next)
+	_id_salt = ""
+
+func test_identify_no_session_once() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	var sdk := start()
+	_id_serve(sdk)
+	sdk.identify("u1")
+	_id_serve(sdk, [[400, {"error": "no_session"}]])
+	eq(_id_count(sdk), 1, "one send")
+	_id_next_session(sdk, [[400, {"error": "no_session"}]])
+	eq(_id_count(sdk), 2, "again once the next session opens")
+	_id_next_session(sdk)
+	eq(_id_count(sdk), 2, "a second no_session in a row ends it for this launch")
+	_id_salt = ""
+
+func test_identify_reset_device_id_keeps_it() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	var sdk := start()
+	_id_serve(sdk)
+	sdk.identify("u1")
+	_id_serve(sdk)
+	var stored = _id_stored()
+	sdk.reset_device_id()
+	eq(_id_stored(), stored, "kept")
+	eq(sdk.is_identified(), true, "still identified")
+	sdk.track_event("a")
+	sdk.flush()
+	_id_serve(sdk)
+	eq(_id_count(sdk), 2, "the next session identifies again")
+	_id_salt = ""
+
+func test_identify_different_account_before_salt() -> void:
+	var v := _identify_vectors()
+	_id_salt = v["salt"]
+	var first := start()
+	_id_serve(first)
+	first.identify("u1")
+	_id_serve(first)
+	_id_free(first)
+	var sdk := start()
+	var device := sdk.device_id
+	sdk.identify("u1")
+	eq(sdk.device_id, device, "the same account keeps the device")
+	sdk.identify("u2")
+	check(sdk.device_id != device, "another account switches the device")
+	eq(_id_stored(), null, "the old identity is gone")
+	_id_serve(sdk)
+	eq(_id_sends(sdk), [{"session": sdk.session_token, "accountHash": v["sequence"][5]["expect"]["stored"]["accountHash"]}], "u2 sent on the new device's session")
+	_id_salt = ""
+
+func test_identify_request_shape() -> void:
+	var v := _identify_vectors()
+	_id_salt = v["salt"]
+	var sdk := start()
+	_id_serve(sdk)
+	sdk.identify("12345")
+	var req: Dictionary = sdk.requests.filter(func(r): return r["path"] == "/identify")[0]
+	eq(req["method"], "POST", "POST")
+	eq(sdk.header(req, "X-API-Key"), "gt_live_test", "the key")
+	eq(sdk.header(req, "X-Session-Token"), sdk.session_token, "the session token")
+	eq(sdk.body_text(req), "{\"accountHash\":\"%s\"}" % v["accept"][0]["wire"], "exactly { accountHash }")
+	check(sdk.body_text(req).find(sdk.device_id) < 0, "no device id")
+	_id_salt = ""
+
+func test_identify_never_queued() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	var sdk := start()
+	_id_serve(sdk)
+	sdk.identify("u1")
+	eq(sdk.pending_events.size(), 0, "nothing queued")
+	sdk.track_event("a")
+	sdk.flush()
+	var batch := sdk.unanswered().filter(func(r): return r["path"] == "/track/batch")
+	eq(batch.size(), 1, "the event goes out while identify is unanswered")
+	sdk._persist_queue(true)
+	var hash: String = _id_stored()["accountHash"]
+	for f in _storage_files():
+		if f != IDENTITY_FILE:
+			check(_read(f).find(hash) < 0, "not in " + f)
+	var dir := DirAccess.open(Fake.TEST_STORAGE_DIR + "ravensight/")
+	for f in (Array(dir.get_files()) if dir else []):
+		check(FileAccess.get_file_as_string(Fake.TEST_STORAGE_DIR + "ravensight/" + f).find(hash) < 0, "not in the queue file " + f)
+	_id_salt = ""
+
+func test_identify_no_key_inert() -> void:
+	var sdk := make({"ingest_key": ""})
+	eq(sdk.identify("u1"), true, "valid")
+	root.add_child(sdk)
+	eq(sdk.identify("a@b"), false, "still validated")
+	eq(sdk.is_identified(), true, "held in memory")
+	sdk.flush()
+	sdk.advance(3600.0)
+	eq(sdk.requests.size(), 0, "no request")
+	eq(_storage_files(), [], "no file")
+	sdk.reset_identity()
+	eq(sdk.is_identified(), false, "reset drops it")
+
+func test_identify_opt_in_holds_until_yes() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	var sdk := start({"consent": "opt_in"})
+	sdk.identify("u1")
+	_id_serve(sdk)
+	eq(sdk.requests.size(), 0, "nothing before the yes")
+	eq(_id_stored(), null, "nothing stored before the yes")
+	sdk.set_tracking_enabled(true)
+	_id_serve(sdk)
+	eq(_id_count(sdk), 1, "sent after the yes")
+	eq(_id_stored(), _identify_vectors()["sequence"][1]["expect"]["stored"], "stored after the yes")
+	sdk.set_tracking_enabled(false)
+	eq(_id_stored(), null, "consent withdrawn deletes it")
+	eq(sdk.is_identified(), false, "and forgets it")
+	_id_free(sdk)
+	# A stored identity is never read before the yes.
+	_write(IDENTITY_FILE, JSON.stringify(_identify_vectors()["sequence"][1]["expect"]["stored"]))
+	var later := start({"consent": "opt_in"})
+	eq(later.is_identified(), false, "not read before the yes")
+	_id_salt = ""
+
+func test_identify_optout_deletes() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	var sdk := start()
+	_id_serve(sdk)
+	sdk.identify("u1")
+	_id_serve(sdk)
+	check(_id_stored() != null, "stored")
+	sdk.set_tracking_enabled(false)
+	eq(_id_stored(), null, "opt-out deletes it")
+	eq(sdk.is_identified(), false, "and forgets it")
+	_id_free(sdk)
+	# A held id is dropped by the opt-out too.
+	_clean_storage()
+	var held := start()
+	held.identify("u1")
+	held.set_tracking_enabled(false)
+	held.set_tracking_enabled(true)
+	_id_serve(held)
+	eq(_id_count(held), 0, "the dropped id is never sent")
+	_id_salt = ""
+
+func test_identify_late_200_after_reset() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	var sdk := start()
+	_id_serve(sdk)
+	sdk.identify("u1")
+	var late: Dictionary = sdk.requests.filter(func(r): return r["path"] == "/identify")[0]
+	sdk.reset_identity()
+	sdk.track_event("a")
+	sdk.flush()
+	# Serve the new session and batch, leaving the old identify unanswered.
+	for i in 10:
+		var open := sdk.unanswered().filter(func(r): return r["path"] != "/identify")
+		if open.is_empty():
+			break
+		var r: Dictionary = open[0]
+		r["answered"] = true
+		if r["path"] == "/session":
+			_id_sessions += 1
+			r["callback"].call(201, PackedStringArray(), JSON.stringify({"token": "S%d" % _id_sessions, "expiresIn": 86400, "identify": {"salt": _id_salt}}).to_utf8_buffer())
+		else:
+			r["callback"].call(202, PackedStringArray(), "{}".to_utf8_buffer())
+	late["answered"] = true
+	late["callback"].call(200, PackedStringArray(), "{\"playerId\":\"px_x\"}".to_utf8_buffer())
+	eq(sdk.is_identified(), false, "a late 200 identifies nothing")
+	eq(_id_stored(), null, "and stores nothing")
+	sdk.identify("u1")
+	_id_serve(sdk)
+	eq(_id_count(sdk), 2, "the same account on the new session is sent")
+	eq(_id_sends(sdk)[1]["session"], sdk.session_token, "on the new session")
+	_id_salt = ""
+
+func test_identify_malformed_stored_ignored() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	for bad in ["not json", "{\"salt\":\"x\",\"accountHash\":\"y\"}", "[1,2]"]:
+		_clean_storage()
+		_write(IDENTITY_FILE, bad)
+		var sdk := start()
+		eq(sdk.is_identified(), false, "ignored: " + bad)
+		_id_serve(sdk)
+		eq(_id_count(sdk), 0, "nothing sent: " + bad)
+		_id_free(sdk)
+	_id_salt = ""
