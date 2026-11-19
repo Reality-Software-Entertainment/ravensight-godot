@@ -83,6 +83,9 @@ It is safe to call from any autoload, even before Ravensight's own
 | `is_tracking_enabled()` | `true` while events are collected: a key, enabled, not opted out (or opted in), kill switch on, key accepted. |
 | `is_enabled()` | The same answer as `is_tracking_enabled()`. Use it to skip work that only feeds analytics. |
 | `reset_device_id()` | Start a fresh analytics identity for this install. Returns the new id. |
+| `identify(account_id)` | Link this device to your game's own account after sign-in. Returns `false` for a refused value. See Identify players who sign in. |
+| `reset_identity()` | On sign-out: forget the account and switch to a fresh device id. |
+| `is_identified()` | `true` while an account is set by `identify()`. |
 | `set_enabled(on)` | The game's own switch for this run (see `enabled`). |
 | `get_status_reason()` | Why nothing is being sent, or `""`. See Startup and failures. |
 | `api_base()` | The API root requests go to, e.g. `https://api.ravensight.io/api/v1`. |
@@ -307,6 +310,7 @@ key and none of these options.
 | 0.3.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
 | 0.5.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Saved queue, origin, gzip and signing, ads and attribution, exposure tagging, device fields. Needs a Ravensight server that keeps millisecond timestamps, accepts `origin`, gzip and signatures, and knows the `rs_ad_*` and `rs_attr_*` keys. |
 | 0.6.0 | 4.x (CI on 4.5-stable) | `/api/v1` | `track_event_at()` sends positions as `rs_x` and `rs_y` for Level heatmaps. |
+| 0.7.0 | 4.x (CI on 4.5-stable) | `/api/v1` | `identify()` and `reset_identity()`. Needs the API's identify support (`POST /identify` and `identify.salt` on the session answer); an API without it gets no identify request. |
 
 ## Levels and deaths
 
@@ -519,6 +523,39 @@ the next launch nothing is sent, not even the kill switch check. Turning it
 off drops the queue and deletes the saved queue file. `reset_device_id()`
 saves a new random id, drops the queue (and its file), the session and the
 attribution flag, and returns the new id.
+
+## Identify players who sign in
+
+If your game has its own login, call `identify()` once the player signs in
+and `reset_identity()` when they sign out. One person on two devices, or
+before and after signing in, then counts as one player.
+
+```gdscript
+Ravensight.identify(account.id)  # after your own sign-in
+Ravensight.reset_identity()      # on sign-out
+```
+
+- **What is sent:** a salted hash of the id (`accountHash`, 64 hex
+  characters, keyed with your game's own salt from the session answer) and
+  the session token, once per session. The raw account id, an email or a
+  name is never sent and never saved; until the first session answer the id
+  is held in memory only.
+- **Pass an opaque internal id**, such as a database key or a UUID, as a
+  `String` or a whole number (used as its decimal digits). A value that is
+  empty, over 256 bytes of UTF-8 or contains `@` is refused: `identify()`
+  returns `false` with one warning and nothing changes.
+- **One event per identified session** on your usage balance. The same
+  account again in the same session sends nothing; a refused or failed
+  request is tried once more at the next session, never in a loop.
+- **A different account** on the same device first does `reset_identity()`,
+  which deletes the saved hash and switches to a fresh device id (as
+  `reset_device_id()` does), so the next player is not linked to the last
+  one. `reset_device_id()` alone keeps the identity.
+- The hash is saved beside the device id in
+  `user://ravensight_identity.save`. It never enters the event queue and
+  never delays an event. Without a key, before the opt-in yes, or in a
+  playtest run it is held in memory only; `set_tracking_enabled(false)`
+  deletes it.
 
 ## Telling players
 
