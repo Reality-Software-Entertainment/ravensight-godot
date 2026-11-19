@@ -2976,6 +2976,9 @@ func test_identify_different_account_before_salt() -> void:
 	sdk.identify("u2")
 	check(sdk.device_id != device, "another account switches the device")
 	eq(_id_stored(), null, "the old identity is gone")
+	# The reset dropped the queue; the next event opens the new session.
+	sdk.track_event("signed_in")
+	sdk.flush()
 	_id_serve(sdk)
 	eq(_id_sends(sdk), [{"session": sdk.session_token, "accountHash": v["sequence"][5]["expect"]["stored"]["accountHash"]}], "u2 sent on the new device's session")
 	_id_salt = ""
