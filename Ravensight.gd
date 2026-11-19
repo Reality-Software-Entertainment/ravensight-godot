@@ -1469,6 +1469,22 @@ func track_event(event_name: String, data: Dictionary = {}) -> void:
 	if pending_events.size() >= MAX_BATCH_SIZE:
 		_flush_pending()
 
+## track_event() with a position for Level heatmaps. `position` is in the
+## game's own world units, one top-down plane per level, y growing downward
+## (Godot 2D). It is sent as the reserved keys rs_x and rs_y (floats) on a
+## copy of `data`, and they win over the same keys in it. When a component is
+## not finite (NAN or INF) the event is still sent, without rs_x and rs_y.
+## Put the level in `data` so the map knows which level the point is in.
+func track_event_at(event_name: String, position: Vector2, data: Dictionary = {}) -> void:
+	var props := data.duplicate()
+	if is_finite(position.x) and is_finite(position.y):
+		props["rs_x"] = float(position.x)
+		props["rs_y"] = float(position.y)
+	else:
+		props.erase("rs_x")
+		props.erase("rs_y")
+	track_event(event_name, props)
+
 ## Config is public game data, never secrets. Invalid/offline responses keep
 ## the last valid cache for this exact endpoint, key, player and build.
 func _current_config_scope() -> String:
