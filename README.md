@@ -75,6 +75,7 @@ It is safe to call from any autoload, even before Ravensight's own
 | Function | What it does |
 | --- | --- |
 | `track_event(name, data = {})` | Queue an event. |
+| `track_event_at(name, position, data = {})` | Queue an event with a `Vector2` position for Level heatmaps. See Positions for Level heatmaps. |
 | `flush()` | Send what is queued now instead of waiting for the timer. Cuts a backoff wait short; a server's Retry-After wait still holds. |
 | `quit(exit_code = 0)` | Send `game_exited` and the queue, then quit. Call it from your own Quit button instead of `get_tree().quit()`. |
 | `submit_feedback(message, category = "", rating = 0)` | Send player feedback. `category` is optional and one of `FEEDBACK_CATEGORIES`: `bug`, `suggestion`, `complaint`, `praise`, `playtest`, `other`. `rating` is 0 to leave it out, or a whole number from 1 to 5. Needs an open session. |
@@ -305,6 +306,7 @@ key and none of these options.
 | Unreleased | 4.x, error capture on 4.5+ (CI on 4.5-stable) | `/api/v1` | Automatic error capture needs the API's error capture support; turn it off with `error_capture = false` against an older API. |
 | 0.3.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
 | 0.5.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Saved queue, origin, gzip and signing, ads and attribution, exposure tagging, device fields. Needs a Ravensight server that keeps millisecond timestamps, accepts `origin`, gzip and signatures, and knows the `rs_ad_*` and `rs_attr_*` keys. |
+| 0.6.0 | 4.x (CI on 4.5-stable) | `/api/v1` | `track_event_at()` sends positions as `rs_x` and `rs_y` for Level heatmaps. |
 
 ## Levels and deaths
 
@@ -325,6 +327,24 @@ Ravensight.track_event("run_over", {"level": "castle", "rs_kind": "death"})
 
 Keys that start with `rs_` are reserved for Ravensight. The SDK sets
 `rs_event_id` itself.
+
+## Positions for Level heatmaps
+
+`track_event_at(name, position, data = {})` is `track_event()` with a
+position. It sends `position.x` and `position.y` as the reserved keys `rs_x`
+and `rs_y`, as floats, in your game's own world units: one top-down plane per
+level, with y growing downward, as in Godot 2D. Put the level in `data` so the
+map knows which level the point belongs to.
+
+```gdscript
+Ravensight.track_event_at("player_died", player.global_position, {"level": "cave_2", "rs_kind": "death"})
+```
+
+It is one ordinary event, sent and counted like any other: nothing extra is
+sent. `rs_x` and `rs_y` win over the same keys in `data`, and your dictionary
+is not changed. If a component is `NAN` or `INF`, the event is still sent,
+without `rs_x` and `rs_y`. Level heatmaps read `rs_x` and `rs_y` first, then
+plain `x` and `y`, so events you already send with `x` and `y` keep working.
 
 ## Typed events
 

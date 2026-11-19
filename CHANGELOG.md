@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.6.0] - 2026-11-18
+
+### Added
+
+- `track_event_at(event_name, position: Vector2, data := {})` for Level heatmaps. It sends `position.x` and `position.y` as the reserved keys `rs_x` and `rs_y` (floats, world units, y growing downward) on a copy of `data`, where they win over the same keys, and otherwise behaves as `track_event()`. A `NAN` or `INF` component sends the event without a position.
 
 ### Fixed
 

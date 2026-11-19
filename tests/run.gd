@@ -85,6 +85,9 @@ func _run() -> void:
 		"test_track_error_properties",
 		"test_typed_extra_data_reserved_keys_win",
 		"test_typed_helpers_respect_optout",
+		"test_track_event_at_sets_position",
+		"test_track_event_at_non_finite_sends_no_position",
+		"test_track_event_at_sends_numbers_and_respects_optout",
 		"test_health_off_by_default",
 		"test_health_summary_percentiles",
 		"test_health_reservoir_is_bounded",
@@ -276,7 +279,7 @@ func test_api_base_forms() -> void:
 	eq(fresh.api_url, "https://api.ravensight.io", "default api_url is the bare host")
 	eq(Fake.REQUEST_TIMEOUT_SECONDS, 15.0, "request timeout")
 	eq(fresh.max_queue_size, 500, "default queue cap")
-	eq(Fake.VERSION, "0.5.0", "version constant")
+	eq(Fake.VERSION, "0.6.0", "version constant")
 	var plain: Node = load("res://Ravensight.gd").new()
 	eq(plain.ingest_key, "", "default ingest_key is empty")
 	eq(plain.consent, "opt_out", "default consent")
@@ -1200,7 +1203,7 @@ func test_session_request_carries_sdk() -> void:
 	var sdk := start()
 	sdk.answer(200, {"trackingEnabled": true})
 	var body = JSON.parse_string(sdk.requests[1]["body"])
-	eq(body["sdk"], "godot/0.5.0", "sdk name and version on session create")
+	eq(body["sdk"], "godot/0.6.0", "sdk name and version on session create")
 
 func test_track_purchase_properties() -> void:
 	var sdk := start()
@@ -1286,6 +1289,49 @@ func test_typed_helpers_respect_optout() -> void:
 	sdk.flush()
 	eq(sdk.requests.size(), 0, "no network while off")
 	eq(sdk.pending_events.size(), 0, "nothing queued while off")
+
+func test_track_event_at_sets_position() -> void:
+	var sdk := start()
+	var extra := {"level": "cave_2", "rs_kind": "death", "rs_x": 99, "rs_y": 98}
+	sdk.track_event_at("player_died", Vector2(12.5, -3.0), extra)
+	eq(last_name(sdk), "player_died", "event name")
+	eq(last_data(sdk), {"level": "cave_2", "rs_kind": "death", "rs_x": 12.5, "rs_y": -3.0}, "position set, reserved keys win")
+	eq(extra, {"level": "cave_2", "rs_kind": "death", "rs_x": 99, "rs_y": 98}, "caller's dictionary is not modified")
+	sdk.track_event_at("spawn", Vector2.ZERO)
+	eq(last_data(sdk), {"rs_x": 0.0, "rs_y": 0.0}, "zero is a position and data is optional")
+	eq(typeof(last_data(sdk)["rs_x"]), TYPE_FLOAT, "rs_x is a float")
+	eq(typeof(last_data(sdk)["rs_y"]), TYPE_FLOAT, "rs_y is a float")
+
+func test_track_event_at_non_finite_sends_no_position() -> void:
+	var sdk := start()
+	var before := sdk.pending_events.size()
+	var bad := [Vector2(NAN, 1.0), Vector2(1.0, NAN), Vector2(INF, 0.0), Vector2(0.0, -INF), Vector2(NAN, INF)]
+	for i in bad.size():
+		sdk.track_event_at("step", bad[i], {"level": "a", "rs_x": 1, "rs_y": 2})
+		eq(last_name(sdk), "step", "still sent for bad case %d" % i)
+		eq(last_data(sdk), {"level": "a"}, "no rs_x or rs_y for bad case %d" % i)
+	eq(sdk.pending_events.size(), before + bad.size(), "every event is queued")
+
+func test_track_event_at_sends_numbers_and_respects_optout() -> void:
+	var sdk := started_with_session()
+	sdk.track_event_at("player_died", Vector2(40.0, 7.5), {"level": "yard"})
+	sdk.flush()
+	var found := false
+	for r in sdk.requests:
+		if r["path"] != "/track/batch":
+			continue
+		for e in sdk.events_in(r):
+			if e["event"] == "player_died":
+				found = true
+				eq(float(e["data"]["rs_x"]), 40.0, "rs_x sent")
+				eq(float(e["data"]["rs_y"]), 7.5, "rs_y sent")
+				check(typeof(e["data"]["rs_x"]) in [TYPE_FLOAT, TYPE_INT], "rs_x is a JSON number")
+				eq(e["data"]["level"], "yard", "level sent")
+	check(found, "the positioned event was sent in a batch")
+	var off := start({"enabled": false})
+	off.track_event_at("player_died", Vector2(1.0, 2.0))
+	eq(off.pending_events.size(), 0, "nothing queued while off")
+	eq(off.requests.size(), 0, "no network while off")
 
 func test_health_off_by_default() -> void:
 	var sdk := started_with_session()
