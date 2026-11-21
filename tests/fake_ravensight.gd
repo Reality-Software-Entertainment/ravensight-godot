@@ -55,6 +55,15 @@ func _is_mobile() -> bool:
 func _is_web() -> bool:
 	return web
 
+## What the page's location.search answers in a web build; page_search_reads
+## counts how often the SDK asked.
+var fake_search: String = ""
+var page_search_reads: int = 0
+
+func _page_search() -> String:
+	page_search_reads += 1
+	return fake_search
+
 func _memory_mb() -> float:
 	return memory
 

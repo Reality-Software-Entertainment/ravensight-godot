@@ -23,3 +23,35 @@ Experiment keys and variant labels may use those words as string values, matchin
 the server contract. Regression coverage distinguishes those cases. Publishing remains held.
 
 Screenshot Player Reports: 444 checks in 71 headless tests passed; all three GDScripts parse successfully. Includes upload/finalize, failure retry identity, credential-free multipart and stale-session rejection. No live storage provider or physical-device screenshot run was performed. Existing held 0.3.1 candidate now includes this feature; no tag, push or publication occurred.
+
+## 0.7.0: campaign links (November 19, 2026)
+
+- Branch `feat/campaign-link`, on `feat/identify` at cbf758a, built to the
+  campaign link contract (the JavaScript SDK is the reference).
+- Godot v4.8.dev1 headless (`bash tests/run.sh <godot>`): **PASS, 1475 checks
+  in 169 tests**, 10 of them campaign link tests (133 checks): the setter, the
+  page address vectors, once per session, kept after a 500, an offline
+  attempt, a 429 and a 201 without a token, a link set while a session is in
+  flight, a playtest run, opt in, opt out, disabled and no key. The red run
+  failed on the missing `set_campaign_link`. CI's Godot 4.5 was not run.
+- `check-gdscript.sh` parse check passed for every script; the README example
+  ran in headless Godot.
+- The web export's page read (`JavaScriptBridge`) is replaced in the tests; no
+  web export was built or run in a browser, and nothing ran on a device.
+- No live Ravensight service was used. Nothing was published, tagged or deployed.
+
+## 0.7.0 release (November 21, 2026)
+
+- Identify and campaign links merged onto 0.6.0. Two identify rules were
+  brought in line with the shared contract, each with a regression test: a
+  second `no_session` answer in a row now stops identify until
+  `reset_identity()` (it stopped the whole launch before; a 404 or
+  `invalid_account_hash` still does), and no identify request is sent in a
+  playtest run that a driver starts with `set_playtest_context()` after the
+  player's saved identity was read.
+- Godot v4.8.dev1 headless: **PASS, 1484 checks in 171 tests**;
+  `check-gdscript.sh` passed for every script. The identify vectors are
+  byte-identical to the shared copy. CI runs the same suites on Godot
+  4.5-stable.
+- Not run here: a web export in a browser, a device, a live Ravensight
+  service.
