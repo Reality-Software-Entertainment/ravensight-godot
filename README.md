@@ -598,7 +598,10 @@ Ravensight.reset_identity()                # on sign-out
   changes.
 - **One event per identified session** on your usage balance. The same
   account again in the same session sends nothing; a refused or failed
-  request is tried once more at the next session, never in a loop.
+  request is tried once more at the next session, never in a loop. A
+  server without identify (404) or a hash it calls malformed stops it until
+  the next launch; a second `no_session` answer in a row stops it until
+  `reset_identity()`.
 - **A different account** on the same device first does `reset_identity()`,
   which deletes the saved hash and switches to a fresh device id (as
   `reset_device_id()` does), so the next player is not linked to the last

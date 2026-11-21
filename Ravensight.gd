@@ -305,6 +305,8 @@ var _identify_sent_on: String = ""
 ## A 404 or invalid_account_hash: no more tries this launch.
 var _identify_stopped: bool = false
 var _identify_no_session_retried: bool = false
+## A second no_session in a row: no more tries until reset_identity().
+var _identify_no_session_stopped: bool = false
 ## The campaign link waiting for the next session this SDK opens for its own
 ## player (24 lowercase hex characters), or "". Memory only, never saved.
 var _campaign_link: String = ""
@@ -2601,6 +2603,7 @@ func _forget_identity() -> void:
 	_has_held_account = false
 	_identity = {}
 	_identify_no_session_retried = false
+	_identify_no_session_stopped = false
 	# Never the player's saved identity in a playtest run.
 	if playtest_token.is_empty():
 		_remove_file(IDENTITY_PATH)
@@ -2661,11 +2664,15 @@ func _read_identify_salt(answer: Dictionary) -> void:
 		_has_held_account = has_held
 	_hash_held_account()
 
-## Sends the identity on the open session, once per session. Never queued.
+## Sends the identity on the open session, once per session. Never queued,
+## and never in a playtest run, even one a driver started with
+## set_playtest_context() after the player's saved identity was read.
 func _send_identify() -> void:
 	if _identity.is_empty() or _identify_salt_state != 1 or _identity["salt"] != _identify_salt:
 		return
-	if _identify_stopped or not _is_active() or not _is_session_valid():
+	if _identify_stopped or _identify_no_session_stopped or not playtest_token.is_empty():
+		return
+	if not _is_active() or not _is_session_valid():
 		return
 	if _identify_sent_on == session_token:
 		return
@@ -2690,9 +2697,10 @@ func _on_identify_response(code: int, _headers: PackedStringArray, body: PackedB
 	if code == 200:
 		_identify_no_session_retried = false
 	elif code == 400 and error == "no_session":
-		# Again once, when the next session opens; twice in a row ends it.
+		# Again once, when the next session opens; twice in a row stops it
+		# until reset_identity().
 		if _identify_no_session_retried:
-			_identify_stopped = true
+			_identify_no_session_stopped = true
 		_identify_no_session_retried = true
 	else:
 		_identify_no_session_retried = false

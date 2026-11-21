@@ -181,6 +181,8 @@ func _run() -> void:
 		"test_identify_review_f4_on_disk_before_yes",
 		"test_identify_review_playtest_leaves_storage",
 		"test_identify_review_f7_clock_ahead",
+		"test_identify_no_session_twice_until_reset",
+		"test_identify_playtest_context_sends_nothing",
 		"test_campaign_link_setter_sent_lowercased_once",
 		"test_campaign_link_invalid_inputs",
 		"test_campaign_link_failed_session_keeps_it",
@@ -2957,7 +2959,51 @@ func test_identify_no_session_once() -> void:
 	_id_next_session(sdk, [[400, {"error": "no_session"}]])
 	eq(_id_count(sdk), 2, "again once the next session opens")
 	_id_next_session(sdk)
-	eq(_id_count(sdk), 2, "a second no_session in a row ends it for this launch")
+	eq(_id_count(sdk), 2, "a second no_session in a row stops it")
+	_id_salt = ""
+
+## The contract: a second no_session in a row stops identify until
+## reset_identity(), not for the rest of the launch. A 404 or
+## invalid_account_hash still stops the launch.
+func test_identify_no_session_twice_until_reset() -> void:
+	_id_salt = _identify_vectors()["salt"]
+	var sdk := start()
+	_id_serve(sdk)
+	sdk.identify("u1")
+	_id_serve(sdk, [[400, {"error": "no_session"}]])
+	_id_next_session(sdk, [[400, {"error": "no_session"}]])
+	_id_next_session(sdk)
+	eq(_id_count(sdk), 2, "stopped after the second no_session")
+	sdk.reset_identity()
+	eq(sdk.identify("u2"), true, "a new account after the sign-out")
+	_id_serve(sdk)
+	eq(_id_count(sdk), 3, "reset_identity() ends the stop")
+	_id_free(sdk)
+	_clean_storage()
+	var stopped := start()
+	_id_serve(stopped)
+	stopped.identify("u1")
+	_id_serve(stopped, [[404, {"error": "not_found"}]])
+	stopped.reset_identity()
+	stopped.identify("u2")
+	_id_serve(stopped)
+	eq(_id_count(stopped), 1, "a 404 still stops the launch, reset or not")
+	_id_salt = ""
+
+## A driver that calls set_playtest_context() itself, after the player's
+## saved identity was read: the playtest session never carries it.
+func test_identify_playtest_context_sends_nothing() -> void:
+	var saved := JSON.stringify(_identify_vectors()["sequence"][1]["expect"]["stored"])
+	_write(IDENTITY_FILE, saved)
+	_id_salt = _identify_vectors()["salt"]
+	var sdk := start()
+	sdk.set_playtest_context({"token": "tok", "run_id": "run1"})
+	sdk.track_event("p")
+	sdk.flush()
+	_id_serve(sdk)
+	check(sdk.paths().has("/session"), "the playtest session opened")
+	eq(_id_count(sdk), 0, "no identify request in a playtest run")
+	eq(_read(IDENTITY_FILE), saved, "the saved identity is left alone")
 	_id_salt = ""
 
 func test_identify_reset_device_id_keeps_it() -> void:
