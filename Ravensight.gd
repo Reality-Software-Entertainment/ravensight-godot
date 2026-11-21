@@ -14,7 +14,7 @@
 extends Node
 
 ## The SDK version. Bumped with every tagged release.
-const VERSION := "0.6.0"
+const VERSION := "0.7.0"
 
 ## --- Signals -------------------------------------------------------------
 
@@ -258,6 +258,12 @@ const AD_RESULTS: Array[String] = ["shown", "clicked", "failed", "rewarded"]
 const ATTRIBUTION_SENT_PATH: String = "user://ravensight_attribution.save"
 
 const DEVICE_ID_PATH: String = "user://device_id.save"
+## identify(): {"salt", "accountHash"} as JSON, beside the device id. Never
+## the account id.
+const IDENTITY_PATH: String = "user://ravensight_identity.save"
+const IDENTIFY_MAX_BYTES: int = 256
+## A campaign link id: 24 hex characters, sent lowercased.
+const CAMPAIGN_LINK_LENGTH: int = 24
 ## Present only while the player has opted out (see set_tracking_enabled).
 const OPTOUT_PATH: String = "user://ravensight_optout.save"
 ## With consent = "opt_in": present only once the player has said yes.
@@ -280,6 +286,28 @@ const CONFIG_PATH := "user://ravensight_config.json"
 ## server should join the same session (send it as `joinToken`, see the
 ## HTTP API). Never write it.
 var session_token: String = ""
+
+## identify(): {"salt", "accountHash"} once hashed, else {}.
+var _identity: Dictionary = {}
+## A valid account id waiting for the salt or the player's yes. Memory only.
+var _held_account_id: String = ""
+var _has_held_account: bool = false
+## The game's identify salt from the session answer; _identify_salt_state
+## is 0 before any answer, 1 known, 2 when the answer had none (an older
+## server: identify is unavailable this launch).
+var _identify_salt: String = ""
+var _identify_salt_state: int = 0
+## Bumped whenever the identity is replaced or forgotten: a late answer for
+## an older one changes nothing.
+var _identify_generation: int = 0
+## The session token identify was last sent on: once per session.
+var _identify_sent_on: String = ""
+## A 404 or invalid_account_hash: no more tries this launch.
+var _identify_stopped: bool = false
+var _identify_no_session_retried: bool = false
+## The campaign link waiting for the next session this SDK opens for its own
+## player (24 lowercase hex characters), or "". Memory only, never saved.
+var _campaign_link: String = ""
 var session_expires_at: int = 0
 var _session_request_pending: bool = false
 ## Bumped every time a session is requested or dropped. Bound into each
@@ -489,6 +517,7 @@ func _init() -> void:
 		# Read only: a saved id is used, but none is created before _ready()
 		# knows there is a key and, with consent = "opt_in", a yes.
 		device_id = _read_saved_device_id()
+		_identity = _read_saved_identity()
 		# Read now, so a track_event() or set_tracking_enabled() from an
 		# earlier autoload already sees the player's choice.
 		_player_opted_out = not _saved_choice()
@@ -512,6 +541,7 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_take_over_quit()
 	_distribution = _validated_distribution()
+	_read_page_campaign_link()
 
 	if playtest_token.is_empty():
 		# The game may have set `consent` after construction: read the
@@ -519,6 +549,9 @@ func _ready() -> void:
 		_player_opted_out = not _saved_choice()
 		if not _player_opted_out:
 			_load_identity()
+		else:
+			# Never used before the player's yes (an opt-out deleted it anyway).
+			_identity = {}
 	_is_ready = true
 	_boot_ms = _ticks_msec()
 
@@ -865,8 +898,9 @@ func _is_random_device_id(id: String) -> bool:
 ## A new device id: 16 random bytes from the platform's secure random source
 ## as lowercase hex, a dash, and the lowercased OS name (kept because the
 ## per-OS split in analytics reads it), e.g. "3f1c...9a-windows". It
-## identifies this install of this game and nothing else. No id, old or
-## new, was ever linked to an account: Ravensight has no player accounts.
+## identifies this install of this game and nothing else. It is never
+## derived from an account; only identify() links it to the game's own
+## account, and only when the game calls it.
 func _generate_device_id() -> String:
 	var random_bytes := Crypto.new().generate_random_bytes(16)
 	return "%s-%s" % [random_bytes.hex_encode(), OS.get_name().to_lower()]
@@ -1308,7 +1342,11 @@ func _start_session(explicit: bool = false) -> void:
 	var device := _device_fields()
 	if not device.is_empty():
 		session_body["device"] = device
-	_send("POST", "/session", headers, _json(session_body), _on_session_response.bind(generation))
+	# The player's own session only, never a playtest run, and once.
+	var campaign_link := _campaign_link if playtest_token.is_empty() else ""
+	if not campaign_link.is_empty():
+		session_body["campaignLink"] = campaign_link
+	_send("POST", "/session", headers, _json(session_body), _on_session_response.bind(generation, campaign_link))
 
 ## The device fields sent on the session: model, OS version and GPU name,
 ## each only when the engine reports it without a permission prompt. No
@@ -1336,7 +1374,14 @@ func _clean_device_field(value: String) -> String:
 	control.compile("[\\x00-\\x1f\\x7f]")
 	return control.sub(value, "", true).strip_edges().left(DEVICE_FIELD_MAX_CHARS).strip_edges()
 
-func _on_session_response(code: int, headers: PackedStringArray, body: PackedByteArray, generation: int) -> void:
+func _on_session_response(code: int, headers: PackedStringArray, body: PackedByteArray, generation: int, campaign_link: String = "") -> void:
+	# The campaign link this request carried opened a session, so it is never
+	# sent again, even when the answer is otherwise ignored below. A link set
+	# while the request was in flight waits for the next session.
+	if code == 201 and not campaign_link.is_empty() and campaign_link == _campaign_link:
+		var opened = _parse_json(body)
+		if opened is Dictionary and opened.has("token"):
+			_campaign_link = ""
 	# A newer session attempt has started (or the session was dropped) since
 	# this request went out. Ignore it rather than let it overwrite state.
 	if generation != _session_request_generation:
@@ -1354,6 +1399,7 @@ func _on_session_response(code: int, headers: PackedStringArray, body: PackedByt
 			session_expires_at = _unix_now() + expires_in
 			_apply_error_capture_settings(parsed, false)
 			_adopt_session_extras(parsed)
+			_read_identify_salt(parsed)
 			_backoff_seconds = DEFAULT_RETRY_SECONDS
 			# A success ends any wait an explicit flush cut short.
 			_stop_retry()
@@ -1362,6 +1408,7 @@ func _on_session_response(code: int, headers: PackedStringArray, body: PackedByt
 			print("Ravensight: session ready")
 			session_ready.emit()
 			_flush_pending()
+			_send_identify()
 			fetch_config()
 		else:
 			push_error("Ravensight: malformed session response")
@@ -2340,6 +2387,8 @@ func set_enabled(value: bool) -> void:
 	else:
 		_update_reason()
 		_activate()
+		# Back on inside a session that is still open.
+		_send_identify()
 
 ## --- Public API: player privacy -------------------------------------------------
 ##
@@ -2364,6 +2413,9 @@ func set_tracking_enabled(value: bool) -> void:
 		print("Ravensight: set_tracking_enabled() ignored in a playtest run")
 		return
 	_save_choice(value)
+	# Opting out, or withdrawing consent, forgets the signed-in account.
+	if not value:
+		_forget_identity()
 	if value != _player_opted_out:
 		# Already as asked.
 		return
@@ -2381,6 +2433,9 @@ func set_tracking_enabled(value: bool) -> void:
 	else:
 		if _is_ready and not _no_key and not _key_refused:
 			_load_identity()
+			if _identity.is_empty() and not _has_held_account:
+				_identity = _read_saved_identity()
+			_hash_held_account()
 		_update_reason()
 		_activate()
 
@@ -2421,6 +2476,227 @@ func reset_device_id() -> String:
 	if _is_ready and _is_active():
 		_load_queue()
 	return device_id
+
+## --- Public API: identify players who sign in --------------------------------
+
+## Links this device to the game's own account once the player signs in, so
+## one person on two devices, or before and after sign-in, counts as one
+## player. Pass an opaque internal id (a database key or a UUID), never an
+## email, a name or a handle. A String, or a whole number used as its decimal
+## digits.
+##
+## Only accountHash, an HMAC-SHA256 of the id keyed with the game's salt from
+## the session answer, leaves the device or is saved (beside the device id,
+## in IDENTITY_PATH). The id is held in memory until that salt is known. It
+## is sent once per session with the session token, one event on the usage
+## meter per identified session; the same account again sends nothing. A
+## different account first does reset_identity(). It never enters the event
+## queue or delays an event. Without a key, before the opt-in yes, or in a
+## playtest run it is held in memory only.
+##
+## Returns false, with one warning, for a value that is not text or a whole
+## number, is empty, is over 256 bytes of UTF-8, or contains "@". Nothing
+## changes then.
+func identify(account_id: Variant) -> bool:
+	var reason := _identify_refusal(account_id)
+	if not reason.is_empty():
+		push_warning("Ravensight: identify() refused (%s): pass a non-empty internal id of at most %d bytes with no @" % [reason, IDENTIFY_MAX_BYTES])
+		return false
+	var id := _identify_text(account_id)
+	# A different account than the one stored or held: a sign-out first.
+	if not _is_same_account(id):
+		reset_identity()
+	if _identify_salt_state == 2:
+		_log_once("identify_unavailable", "Ravensight: identify is not offered by this server, nothing is sent this launch", false)
+		return true
+	if _identify_salt_state == 0 or not _identity_allowed():
+		# No salt this launch yet, or not allowed to save: hold the id in
+		# memory only, and hash it under whichever salt the answer brings.
+		_held_account_id = id
+		_has_held_account = true
+		return true
+	if _identity.is_empty():
+		_identity = {"salt": _identify_salt, "accountHash": _identify_hash(_identify_salt, id)}
+		_write_identity()
+	_held_account_id = ""
+	_has_held_account = false
+	if _is_session_valid():
+		_send_identify()
+	else:
+		_start_session()
+	return true
+
+## For sign-out: forgets the stored or held account and switches to a fresh
+## device id as reset_device_id() does, so the next session is not linked to
+## the previous account. Sends nothing. Does nothing (and keeps the device
+## id) when no account is stored or held.
+func reset_identity() -> void:
+	# An identity saved by an earlier launch counts too, even before the
+	# opt-in yes, when it was never loaded.
+	var on_disk := playtest_token.is_empty() and FileAccess.file_exists(_path(IDENTITY_PATH))
+	if _identity.is_empty() and not _has_held_account and not on_disk:
+		return
+	_forget_identity()
+	reset_device_id()
+
+## True while an account is stored or held by identify(). The account id
+## itself is never readable.
+func is_identified() -> bool:
+	return not _identity.is_empty() or _has_held_account
+
+## "" when identify() accepts `account_id`, otherwise the reason: not_text,
+## empty, too_long or looks_like_email.
+func _identify_refusal(account_id: Variant) -> String:
+	var kind := typeof(account_id)
+	if kind == TYPE_FLOAT:
+		var f: float = account_id
+		if is_nan(f) or is_inf(f) or f != floorf(f) or absf(f) > 9007199254740991.0:
+			return "not_text"
+	elif kind != TYPE_STRING and kind != TYPE_STRING_NAME and kind != TYPE_INT:
+		return "not_text"
+	var text := _identify_text(account_id)
+	if text.is_empty():
+		return "empty"
+	if text.to_utf8_buffer().size() > IDENTIFY_MAX_BYTES:
+		return "too_long"
+	if text.contains("@"):
+		return "looks_like_email"
+	return ""
+
+## The account id as text, exactly as given: never trimmed or normalised.
+func _identify_text(account_id: Variant) -> String:
+	match typeof(account_id):
+		TYPE_INT:
+			return str(account_id)
+		TYPE_FLOAT:
+			return str(int(account_id))
+		TYPE_STRING, TYPE_STRING_NAME:
+			return String(account_id)
+	return ""
+
+## Lowercase hex HMAC-SHA256, keyed with the UTF-8 bytes of the salt text as
+## given (not hex-decoded), over the UTF-8 bytes of the account id.
+func _identify_hash(salt: String, id: String) -> String:
+	return Crypto.new().hmac_digest(HashingContext.HASH_SHA256, salt.to_utf8_buffer(), id.to_utf8_buffer()).hex_encode()
+
+## Whether identify may hash and save now: a key, the player's choice, not a
+## playtest run.
+func _identity_allowed() -> bool:
+	return _is_ready and not _no_key and not _player_opted_out and playtest_token.is_empty()
+
+## True when `id` is the account stored or held, or when none is.
+func _is_same_account(id: String) -> bool:
+	if _has_held_account:
+		return _held_account_id == id
+	if not _identity.is_empty():
+		return _identify_hash(_identity["salt"], id) == _identity["accountHash"]
+	return true
+
+func _forget_identity() -> void:
+	_identify_generation += 1
+	_identify_sent_on = ""
+	_held_account_id = ""
+	_has_held_account = false
+	_identity = {}
+	_identify_no_session_retried = false
+	# Never the player's saved identity in a playtest run.
+	if playtest_token.is_empty():
+		_remove_file(IDENTITY_PATH)
+
+## The saved identity when it is well formed, otherwise {}. Never writes.
+func _read_saved_identity() -> Dictionary:
+	var text := _read_text(IDENTITY_PATH)
+	if text.is_empty():
+		return {}
+	var parsed = JSON.parse_string(text)
+	if parsed is Dictionary and _is_hex64(parsed.get("salt")) and _is_hex64(parsed.get("accountHash")):
+		return {"salt": parsed["salt"], "accountHash": parsed["accountHash"]}
+	return {}
+
+func _is_hex64(value: Variant) -> bool:
+	if not value is String:
+		return false
+	var pattern := RegEx.new()
+	pattern.compile("^[0-9a-f]{64}$")
+	return pattern.search(value) != null
+
+func _write_identity() -> void:
+	if _identity.is_empty() or not _identity_allowed():
+		return
+	_write_text(IDENTITY_PATH, _json(_identity))
+
+## Hashes a held account id once the salt is known and saving is allowed.
+func _hash_held_account() -> void:
+	if not _has_held_account or _identify_salt_state != 1 or not _identity_allowed():
+		return
+	_identity = {"salt": _identify_salt, "accountHash": _identify_hash(_identify_salt, _held_account_id)}
+	_held_account_id = ""
+	_has_held_account = false
+	_write_identity()
+
+## Reads identify.salt from a session answer. The first answer decides
+## whether this server offers identify this launch; a salt other than the
+## saved one (another game's key) deletes the saved identity unsent.
+func _read_identify_salt(answer: Dictionary) -> void:
+	if _identify_salt_state == 2:
+		return
+	var block = answer.get("identify")
+	var salt = block.get("salt") if block is Dictionary else null
+	if not _is_hex64(salt):
+		if _identify_salt_state == 0:
+			_identify_salt_state = 2
+			_held_account_id = ""
+			_has_held_account = false
+			_identify_generation += 1
+		return
+	_identify_salt = salt
+	_identify_salt_state = 1
+	if not _identity.is_empty() and _identity["salt"] != salt:
+		var held := _held_account_id
+		var has_held := _has_held_account
+		_forget_identity()
+		_held_account_id = held
+		_has_held_account = has_held
+	_hash_held_account()
+
+## Sends the identity on the open session, once per session. Never queued.
+func _send_identify() -> void:
+	if _identity.is_empty() or _identify_salt_state != 1 or _identity["salt"] != _identify_salt:
+		return
+	if _identify_stopped or not _is_active() or not _is_session_valid():
+		return
+	if _identify_sent_on == session_token:
+		return
+	_identify_sent_on = session_token
+	var headers := ["Content-Type: application/json", "X-API-Key: " + ingest_key, "X-Session-Token: " + session_token]
+	_send("POST", "/identify", headers, _json({"accountHash": _identity["accountHash"]}), _on_identify_response.bind(_identify_generation))
+
+func _on_identify_response(code: int, _headers: PackedStringArray, body: PackedByteArray, generation: int) -> void:
+	var error := _extract_error(body, "")
+	# The server does not offer identify, or calls the hash malformed (a
+	# bug): whatever identity is current, retrying this launch cannot help.
+	if code == 404:
+		_identify_stopped = true
+		return
+	if code == 400 and error == "invalid_account_hash":
+		_identify_stopped = true
+		_log_once("identify_invalid_hash", "Ravensight: identify was refused as invalid_account_hash; not retried this launch", true)
+		return
+	# A late answer for an identity since replaced or forgotten.
+	if generation != _identify_generation:
+		return
+	if code == 200:
+		_identify_no_session_retried = false
+	elif code == 400 and error == "no_session":
+		# Again once, when the next session opens; twice in a row ends it.
+		if _identify_no_session_retried:
+			_identify_stopped = true
+		_identify_no_session_retried = true
+	else:
+		_identify_no_session_retried = false
+	# Anything else (409, 429 identify_limited, rate_limited or needs_funds,
+	# 5xx, offline): the identity is kept, this session is not tried again,
+	# and the next session tries once more.
 
 ## Starts experiment exposure over for a new session.
 func _reset_session_scope() -> void:
@@ -2505,6 +2781,93 @@ func _on_playtest_refused(error: String) -> void:
 
 func _is_fatal_playtest_error(error: String) -> bool:
 	return error == "invalid_playtest_token" or error == "playtest_job_closed"
+
+## --- Public API: campaign links ---------------------------------------------------
+
+## Sends a Ravensight campaign link with the next session this SDK opens, so
+## the player is counted on the Campaign links page. A web build reads
+## `rs_link` from the page address by itself; in a native build, call this
+## from the deep link, universal link, App Link or install referrer handler
+## your game already has, with the `rs_link` value of the incoming address.
+## Best called before the first session opens; a later call goes with the
+## next session the SDK opens.
+##
+## Returns true when `link_id` is a link id (24 hex characters, in any case),
+## which then replaces any link waiting. Returns false for anything else,
+## and nothing changes. The link is held in memory only, sent once, never in
+## a playtest run, and only when a session may open (a key, and with
+## consent = "opt_in" the player's yes).
+func set_campaign_link(link_id: Variant) -> bool:
+	var link := _campaign_link_id(link_id)
+	if link.is_empty():
+		return false
+	_campaign_link = link
+	return true
+
+## `value` lowercased when it is a campaign link id, otherwise "". Never
+## trimmed: surrounding spaces make it invalid.
+func _campaign_link_id(value: Variant) -> String:
+	if typeof(value) != TYPE_STRING and typeof(value) != TYPE_STRING_NAME:
+		return ""
+	var text := String(value)
+	if text.length() != CAMPAIGN_LINK_LENGTH:
+		return ""
+	for i in text.length():
+		if not "0123456789abcdefABCDEF".contains(text[i]):
+			return ""
+	return text.to_lower()
+
+## A web build reads the campaign link the page was reached by, once, at
+## start. A link the game set before this keeps its place. The address is
+## never changed and the link is never saved.
+func _read_page_campaign_link() -> void:
+	if not _is_web() or not _campaign_link.is_empty():
+		return
+	_campaign_link = _campaign_link_from_search(_page_search())
+
+## The page's location.search in a web build, through JavaScriptBridge, or ""
+## when the bridge is missing or answers anything but text. Replaced in tests.
+func _page_search() -> String:
+	if not Engine.has_singleton("JavaScriptBridge"):
+		return ""
+	var search = Engine.get_singleton("JavaScriptBridge").eval("window.location.search", true)
+	return search if search is String else ""
+
+## The first `rs_link` of a query string, read the way a browser's
+## URLSearchParams reads it, when it is a link id; otherwise "". A leading
+## "?" is skipped and anything from "#" on is left out, as location.search
+## leaves out the fragment.
+func _campaign_link_from_search(search: String) -> String:
+	var query := search.get_slice("#", 0)
+	if query.begins_with("?"):
+		query = query.substr(1)
+	for pair in query.split("&", false):
+		var eq_at := pair.find("=")
+		var key := pair if eq_at < 0 else pair.substr(0, eq_at)
+		if _form_decode(key) == "rs_link":
+			return _campaign_link_id(_form_decode("" if eq_at < 0 else pair.substr(eq_at + 1)))
+	return ""
+
+## application/x-www-form-urlencoded decoding as browsers do it: "+" is a
+## space and %XX (either case) a byte, read as UTF-8; a "%" not followed by
+## two hex digits stays as it is. String.uri_decode() differs on lower case
+## escapes, so it is not used.
+func _form_decode(text: String) -> String:
+	var src := text.replace("+", " ").to_utf8_buffer()
+	var out := PackedByteArray()
+	var hex := "0123456789abcdef"
+	var i := 0
+	while i < src.size():
+		if src[i] == 0x25 and i + 2 < src.size():
+			var high := hex.find(char(src[i + 1]).to_lower())
+			var low := hex.find(char(src[i + 2]).to_lower())
+			if high >= 0 and low >= 0:
+				out.append(high * 16 + low)
+				i += 3
+				continue
+		out.append(src[i])
+		i += 1
+	return out.get_string_from_utf8()
 
 ## --- Queue ---------------------------------------------------------------------------
 

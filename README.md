@@ -83,6 +83,9 @@ It is safe to call from any autoload, even before Ravensight's own
 | `is_tracking_enabled()` | `true` while events are collected: a key, enabled, not opted out (or opted in), kill switch on, key accepted. |
 | `is_enabled()` | The same answer as `is_tracking_enabled()`. Use it to skip work that only feeds analytics. |
 | `reset_device_id()` | Start a fresh analytics identity for this install. Returns the new id. |
+| `identify(account_id)` | Link this device to your game's own account after sign-in. Returns `false` for a refused value. See Identify players who sign in. |
+| `reset_identity()` | On sign-out: forget the account and switch to a fresh device id. |
+| `is_identified()` | `true` while an account is set by `identify()`. |
 | `set_enabled(on)` | The game's own switch for this run (see `enabled`). |
 | `get_status_reason()` | Why nothing is being sent, or `""`. See Startup and failures. |
 | `api_base()` | The API root requests go to, e.g. `https://api.ravensight.io/api/v1`. |
@@ -98,6 +101,7 @@ It is safe to call from any autoload, even before Ravensight's own
 | `track_ad_revenue(network, format, placement, revenue_micros, currency)` | Queue a paid impression (`result` `shown`). |
 | `micros_from_decimal_string(text)`, `micros_from_revenue(value)` | Static. Revenue in micros as a digit string, without multiplying a float. |
 | `set_attribution(attribution)` | Queue where this install was acquired, once per install. |
+| `set_campaign_link(link_id)` | Send a Ravensight campaign link id with the next session. Returns `false` for anything but a link id. A web build reads it from the page address by itself. See Campaign links. |
 | `get_device_id()` | This install's random device id, for an attribution partner's customer user id. |
 | `get_config(key, fallback)` | A remote config value. The first read in a session marks running experiments as exposed. See Remote configuration and experiments. |
 | `get_delivery_stats()` | Events let go of since launch: `dropped_overflow`, `dropped_too_old`, `dropped_refused`. |
@@ -307,6 +311,7 @@ key and none of these options.
 | 0.3.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
 | 0.5.0 | 4.x (CI on 4.5-stable) | `/api/v1` | Saved queue, origin, gzip and signing, ads and attribution, exposure tagging, device fields. Needs a Ravensight server that keeps millisecond timestamps, accepts `origin`, gzip and signatures, and knows the `rs_ad_*` and `rs_attr_*` keys. |
 | 0.6.0 | 4.x (CI on 4.5-stable) | `/api/v1` | `track_event_at()` sends positions as `rs_x` and `rs_y` for Level heatmaps. |
+| 0.7.0 | 4.x (CI on 4.5-stable) | `/api/v1` | `identify()` and `reset_identity()`. Needs the API's identify support (`POST /identify` and `identify.salt` on the session answer); an API without it gets no identify request. Campaign links: `campaignLink` on the session, which an API without campaign links ignores. |
 
 ## Levels and deaths
 
@@ -490,6 +495,47 @@ partner name), `network`, `campaign`, `adset`, `creative` and `touch_time`
 callback name this device, pass `Ravensight.get_device_id()` to the partner
 as its customer user id before the partner starts.
 
+## Campaign links
+
+A Ravensight campaign link adds `rs_link=<link id>` to the address it
+redirects to. When that address is your game's web build, the SDK reads
+`rs_link` from the page address (`location.search`) once, when it starts,
+and sends it as `campaignLink` with the first session it opens. Nothing to
+call.
+
+A native build passes it on itself. Point the campaign link at your own
+https page, and call `set_campaign_link()` from the deep link, universal
+link, App Link or install referrer handler your game already has, with the
+`rs_link` value of the incoming address:
+
+```gdscript
+# url is the address your link handler hands the game, such as
+# https://yourgame.example/play?rs_link=64b0000000000000000000a1
+func _on_link_opened(url: String) -> void:
+	var query := url.get_slice("#", 0).get_slice("?", 1)
+	for pair in query.split("&", false):
+		if pair.get_slice("=", 0) == "rs_link":
+			Ravensight.set_campaign_link(pair.get_slice("=", 1))
+			break
+```
+
+`set_campaign_link()` returns `true` when the value is a link id (24 hex
+characters, in any case) and `false`, changing nothing, for anything else.
+A valid call replaces a link still waiting. Call it before the first session
+opens if you can; a later call goes with the next session the SDK opens.
+
+- **Sent once.** Only a session answer with a token clears it, so a failed
+  attempt keeps it for the next one. Later sessions carry none.
+- **Same consent as everything else.** With `consent = "opt_in"` it goes
+  with the first session after the player's yes. An opted out player, a run
+  with `enabled = false` or without a key sends nothing, and a playtest run
+  never sends it.
+- **Nothing is stored**, and the page address is left exactly as it is. The
+  id is one your studio made, not personal data.
+- The server keeps it only when it names a link of the same game. The player
+  and the session are then counted on the Campaign links page, by link, and
+  those players open in Player insights.
+
 ## Player privacy
 
 The device id is 16 random bytes from the operating system's secure random
@@ -511,6 +557,9 @@ them without a permission prompt:
   version only) and `gpu` (`RenderingServer.get_video_adapter_name()`). Each
   is at most 128 printable characters; none is a hardware identifier.
   Country is never sent by the SDK.
+- **Campaign link**, once, on the next session: the `rs_link` value of the
+  page address in a web build, or the id given to `set_campaign_link()`,
+  when it is a link id. Nothing else from the address is read.
 
 `set_tracking_enabled()` writes the choice at once and can be called at any
 time, even from an autoload that runs before Ravensight's `_ready()`, or
@@ -519,6 +568,39 @@ the next launch nothing is sent, not even the kill switch check. Turning it
 off drops the queue and deletes the saved queue file. `reset_device_id()`
 saves a new random id, drops the queue (and its file), the session and the
 attribution flag, and returns the new id.
+
+## Identify players who sign in
+
+If your game has its own login, call `identify()` once the player signs in
+and `reset_identity()` when they sign out. One person on two devices, or
+before and after signing in, then counts as one player.
+
+```gdscript
+Ravensight.identify(account.id)  # after your own sign-in
+Ravensight.reset_identity()      # on sign-out
+```
+
+- **What is sent:** a salted hash of the id (`accountHash`, 64 hex
+  characters, keyed with your game's own salt from the session answer) and
+  the session token, once per session. The raw account id, an email or a
+  name is never sent and never saved; until the first session answer the id
+  is held in memory only.
+- **Pass an opaque internal id**, such as a database key or a UUID, as a
+  `String` or a whole number (used as its decimal digits). A value that is
+  empty, over 256 bytes of UTF-8 or contains `@` is refused: `identify()`
+  returns `false` with one warning and nothing changes.
+- **One event per identified session** on your usage balance. The same
+  account again in the same session sends nothing; a refused or failed
+  request is tried once more at the next session, never in a loop.
+- **A different account** on the same device first does `reset_identity()`,
+  which deletes the saved hash and switches to a fresh device id (as
+  `reset_device_id()` does), so the next player is not linked to the last
+  one. `reset_device_id()` alone keeps the identity.
+- The hash is saved beside the device id in
+  `user://ravensight_identity.save`. It never enters the event queue and
+  never delays an event. Without a key, before the opt-in yes, or in a
+  playtest run it is held in memory only; `set_tracking_enabled(false)`
+  deletes it.
 
 ## Telling players
 

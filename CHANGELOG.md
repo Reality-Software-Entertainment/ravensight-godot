@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.0] - 2026-11-19
+
+Needs a Ravensight server with `POST /identify` and `identify.salt` on the
+session answer; until then identify sends nothing.
+
+### Added
+
+- `identify(account_id)`, `reset_identity()` and `is_identified()` for games with their own login. Only a salted hash of the id (`accountHash`, HMAC-SHA256 keyed with the game's salt from the session answer) is sent, with the session token, once per session; the raw id is never sent or saved and is held in memory only until the salt is known. The hash is saved in `user://ravensight_identity.save`. A value that is not a `String` or whole number, is empty, is over 256 bytes of UTF-8 or contains `@` is refused (`false` and one warning). A different account first resets the identity, which also switches to a fresh device id; `reset_device_id()` alone keeps it. A failed or refused request is tried again at the next session, never in a loop. Without a key, before the opt-in yes or in a playtest run nothing is saved or sent, and opting out deletes the saved hash.
+- Campaign links: a web build reads `rs_link` from the page address once at start, and `set_campaign_link(link_id)` (returns `bool`) passes one on from a deep link, App Link or install referrer handler. A link id (24 hex characters, sent lowercased) goes as `campaignLink` on the next session the SDK opens for its own player, never in a playtest run, and is cleared only when that session answers with a token. Memory only, with the same consent and key rules as everything else.
+
 ## [0.6.0] - 2026-11-18
 
 ### Added
