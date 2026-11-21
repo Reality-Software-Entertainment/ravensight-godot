@@ -2481,9 +2481,11 @@ func reset_device_id() -> String:
 
 ## Links this device to the game's own account once the player signs in, so
 ## one person on two devices, or before and after sign-in, counts as one
-## player. Pass an opaque internal id (a database key or a UUID), never an
-## email, a name or a handle. A String, or a whole number used as its decimal
-## digits.
+## player. Pass a random, high-entropy id (a random UUID or analytics id
+## stored with the account), never a sequential database key, an email, a
+## name or a handle: the salt reaches every client, so a guessable id can be
+## matched. The hash is a pseudonymous identifier to declare in the game's
+## privacy notice. A String, or a whole number used as its decimal digits.
 ##
 ## Only accountHash, an HMAC-SHA256 of the id keyed with the game's salt from
 ## the session answer, leaves the device or is saved (beside the device id,

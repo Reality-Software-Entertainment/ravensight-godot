@@ -576,8 +576,8 @@ and `reset_identity()` when they sign out. One person on two devices, or
 before and after signing in, then counts as one player.
 
 ```gdscript
-Ravensight.identify(account.id)  # after your own sign-in
-Ravensight.reset_identity()      # on sign-out
+Ravensight.identify(account.analytics_id)  # after your own sign-in: a random id stored with the account
+Ravensight.reset_identity()                # on sign-out
 ```
 
 - **What is sent:** a salted hash of the id (`accountHash`, 64 hex
@@ -585,10 +585,17 @@ Ravensight.reset_identity()      # on sign-out
   the session token, once per session. The raw account id, an email or a
   name is never sent and never saved; until the first session answer the id
   is held in memory only.
-- **Pass an opaque internal id**, such as a database key or a UUID, as a
-  `String` or a whole number (used as its decimal digits). A value that is
-  empty, over 256 bytes of UTF-8 or contains `@` is refused: `identify()`
-  returns `false` with one warning and nothing changes.
+- **Pass a random, high-entropy id**, such as a random UUID or a random
+  analytics id you make once for each account and store with it, never a
+  sequential database key, an email, a name or a handle. Your game's salt
+  reaches every copy of the game, so anyone could hash 1, 2, 3 and onward
+  and match a guessable id; a random one cannot be guessed. The hash is
+  still a pseudonymous identifier for the player: declare it in your game's
+  privacy notice. Pass it as a `String`; a whole number is accepted and used
+  as its decimal digits, but a sequential number is exactly the guessable
+  kind. A value that is empty, over 256 bytes of UTF-8 or contains `@` is
+  refused: `identify()` returns `false` with one warning and nothing
+  changes.
 - **One event per identified session** on your usage balance. The same
   account again in the same session sends nothing; a refused or failed
   request is tried once more at the next session, never in a loop.
